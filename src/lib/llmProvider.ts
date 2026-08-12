@@ -202,9 +202,12 @@ logProviderConfigAtStartup();
 
 // --- OpenAI-style tool declarations (all five providers here are
 // OpenAI-compatible chat-completions APIs, so tools are described the same
-// way regardless of which one answers). Kora's 10 sales tools — 6
-// conversation/checkout tools plus the 4 smarter-alternative tools — see
-// lib/tools.ts for the implementations these names map to. ---
+// way regardless of which one answers). Kora's 13 sales tools — the
+// original 10 cart-recovery tools (6 conversation/checkout tools plus the
+// 4 smarter-alternative tools), removeCartItem (multi-item partial
+// selection), plus 2 more backing the two profile-driven campaign triggers
+// (recommendations, browse-abandonment) — see lib/tools.ts for the
+// implementations these names map to. ---
 
 interface JsonSchema {
   type: string;
@@ -365,6 +368,22 @@ const toolDeclarations: ToolDeclaration[] = [
   {
     type: 'function',
     function: {
+      name: 'removeCartItem',
+      description:
+        "Remove ONE item from a multi-item cart when the customer says they only want part of what's in it (e.g. 'just the co-ord set, not the top'). Call this BEFORE replying — it's what actually updates the cart so pricing and checkout reflect only what they still want, not the original full cart. Refuses if it would leave the cart with zero items (use markCartOutcome(\"lost\") instead if they want none of it), or once a checkout link already exists.",
+      parameters: {
+        type: 'object',
+        properties: {
+          cartId: { type: 'string', description: 'The cart ID.' },
+          itemId: { type: 'string', description: 'The catalog item ID of the item to REMOVE (the one they do NOT want), exactly as returned by getCartDetails.' },
+        },
+        required: ['cartId', 'itemId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'createCheckoutLink',
       description:
         "Create a checkout link once the customer has agreed to complete the purchase. Pass the discount code only if one was actually generated in this conversation and the customer accepted it. This records intent to buy, NOT a completed sale — do not call markCartOutcome after this, and do not tell the customer the order is confirmed. Payment is confirmed separately, outside this conversation.",
@@ -399,6 +418,38 @@ const toolDeclarations: ToolDeclaration[] = [
           },
         },
         required: ['cartId', 'outcome'],
+      },
+    },
+  },
+  // -- Recommendations (Trigger 1) --
+  {
+    type: 'function',
+    function: {
+      name: 'getRecommendationsFromHistory',
+      description:
+        "Get real catalog items that genuinely complement this customer's actual past purchases — filtered to items they don't already own, their known size, and their typical spend band. Call this to suggest something new; never invent a recommended item or price yourself. Results present exactly like any other alternatives list (numbered, then selectAlternative once they pick one).",
+      parameters: {
+        type: 'object',
+        properties: {
+          customerId: { type: 'string', description: "The customer's ID." },
+        },
+        required: ['customerId'],
+      },
+    },
+  },
+  // -- Browse-abandonment (Trigger 2) --
+  {
+    type: 'function',
+    function: {
+      name: 'getBrowseAbandonment',
+      description:
+        "Get items this customer viewed repeatedly (3+ times) without buying and without it being in an active cart. Call this before referencing anything about what someone was browsing — never guess or say 'I noticed you looking at X' from anything other than this tool's own result, and keep the tone light — reference the item itself (e.g. it's back in their size, or popular), never the act of watching them browse.",
+      parameters: {
+        type: 'object',
+        properties: {
+          customerId: { type: 'string', description: "The customer's ID." },
+        },
+        required: ['customerId'],
       },
     },
   },

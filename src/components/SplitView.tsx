@@ -7,12 +7,16 @@ interface SplitViewProps {
 }
 
 /**
- * Fixed 50/50 split above `md` (768px) — the whole point of this demo is
- * showing the customer's WhatsApp thread and the brand's dashboard side by
- * side, so the split is never allowed to shrink into two unreadable
- * slivers. Below `md`, chat goes full width and the dashboard becomes a
- * tab. Both panels stay mounted (hidden, not unmounted) so switching tabs
- * never loses chat scroll position or an in-progress draft.
+ * Fixed 35/65 split above `md` (768px), chat/dashboard — matches the
+ * returns demo's proportions rather than an even 50/50. The chat panel
+ * only ever needs to fit narrow WhatsApp bubbles; a full half of the
+ * screen left a large empty gap above the conversation. The dashboard
+ * carries a six-column table plus hero cards and a funnel — it's the side
+ * that actually needs the room. The split is never allowed to shrink into
+ * two unreadable slivers below `md`, where chat goes full width and the
+ * dashboard becomes a tab instead. Both panels stay mounted (hidden, not
+ * unmounted) so switching tabs never loses chat scroll position or an
+ * in-progress draft.
  */
 export function SplitView({ accent, left, right }: SplitViewProps) {
   const [mobileTab, setMobileTab] = useState<'left' | 'right'>('left');
@@ -23,7 +27,7 @@ export function SplitView({ accent, left, right }: SplitViewProps) {
     }`;
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col md:grid md:grid-cols-2">
+    <div className="flex min-h-0 flex-1 flex-col md:grid md:grid-cols-[35fr_65fr]">
       <div className="flex border-b border-[#e2e4e8] bg-white md:hidden">
         <button
           type="button"

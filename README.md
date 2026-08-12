@@ -197,6 +197,15 @@ into Kora's "clay" half (dark ink header, warm parchment background) rather than
 with the chat panel. The chat panel itself is untouched — differentiation is scoped entirely to the half of the
 screen that's actually a different kind of product.
 
+**Why there's no replenishment trigger.** A repeat-purchase nudge ("you're probably due for a reorder") was built
+end-to-end against this same customer-profile layer — its own catalog flags, its own tools, its own scenarios — and
+then deliberately removed. Fashion isn't a consumables vertical the way grooming, supplements, or FMCG are: a
+customer doesn't run out of a kurta the way they run out of a razor cartridge, so a "due for a refill" framing fit
+Kora's own catalog far more awkwardly than the other two profile-driven triggers (recommendations, genuinely
+grounded in a real past purchase; browse-abandonment, genuinely grounded in real repeat-view behavior). Removed
+rather than left in disabled, so the campaign-type selector only ever shows triggers that make sense for this
+brand — see `types.ts`'s `CampaignType` doc for where this decision is recorded in code.
+
 **Why the split screen.** Nobody sees both panels in real life — the customer sees WhatsApp, the brand sees a
 dashboard. Showing them side by side is how a buyer in a sales call understands that the two are the same
 conversation viewed from opposite sides: every tool call on the left is a number changing on the right, live.

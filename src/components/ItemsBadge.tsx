@@ -56,7 +56,7 @@ export function ItemsBadge({ cart, colors, surface }: ItemsBadgeProps) {
             ? { backgroundColor: open ? '#dbe0e3' : '#e9edef', color: '#3b4a54' }
             : {
                 backgroundColor: open ? `${colors.accent}26` : '#EDEFF2',
-                color: open ? '#0F7A55' : '#5B6270',
+                color: open ? colors.accentDark : '#5B6270',
               }
         }
       >

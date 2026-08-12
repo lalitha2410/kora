@@ -1,0 +1,11 @@
+import { chromium } from 'playwright';
+const outDir = String.raw`C:\Users\kamal\AppData\Local\Temp\claude\c--Users-kamal-Desktop-react-projects-CartRecovery\706691fd-341c-42e8-a9a7-bf222be9c4a6\scratchpad`;
+const port = process.argv[2] ?? '5173';
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+await page.goto(`http://localhost:${port}/`, { waitUntil: 'networkidle' });
+await page.click('text=Got it').catch(() => {});
+await page.waitForTimeout(300);
+const box = await page.locator('text=Cart Recovery Campaign').locator('../..').boundingBox();
+await page.screenshot({ path: `${outDir}/harmonized-zoom.png`, clip: { x: box.x, y: box.y, width: box.width, height: 300 } });
+await browser.close();

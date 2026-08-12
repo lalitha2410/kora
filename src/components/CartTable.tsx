@@ -33,7 +33,7 @@ function outcomeStyle(
 ): { label: string; bg: string; fg: string; bar: string; title?: string } {
   switch (cart.outcome) {
     case 'recovered':
-      return { label: 'Recovered', bg: `${colors.accent}22`, fg: '#0F7A55', bar: colors.accent };
+      return { label: 'Recovered', bg: `${colors.accent}22`, fg: colors.accentDark, bar: colors.accent };
     case 'checkout_sent':
       return {
         label: 'Checkout sent',
@@ -84,19 +84,19 @@ function timeAgo(ms: number): string {
   return `${Math.round(hours / 24)}d ago`;
 }
 
-export function CartTableHeader({ colors }: { colors: BrandColors }) {
+export function CartTableHeader({ colors, timeLabel = 'Abandoned' }: { colors: BrandColors; timeLabel?: string }) {
   return (
     <div
       className="grid grid-cols-[3px_1.3fr_1.6fr_0.8fr_0.9fr_0.9fr_0.9fr] gap-2 px-3 py-1.5 text-[9.5px] font-semibold uppercase tracking-[0.08em]"
-      style={{ backgroundColor: colors.ink, color: colors.accent }}
+      style={{ backgroundColor: colors.paper, color: colors.accentDark }}
     >
       <span />
       <span>Customer</span>
       <span>Item(s)</span>
-      <span className="text-right">Cart value</span>
+      <span className="text-right">Value</span>
       <span>Status</span>
       <span>Discount</span>
-      <span className="text-right">Abandoned</span>
+      <span className="text-right">{timeLabel}</span>
     </div>
   );
 }
@@ -177,7 +177,7 @@ export function CartTableRow({
               onMarkPaid();
             }}
             className="shrink-0 rounded px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-[0.04em] transition-colors hover:opacity-80"
-            style={{ backgroundColor: `${colors.accent}22`, color: '#0F7A55' }}
+            style={{ backgroundColor: `${colors.accent}22`, color: colors.accentDark }}
             title="Demo-only: confirm payment for this cart. In production this would happen automatically via a payment webhook, not a manual click — see the README."
           >
             Mark paid

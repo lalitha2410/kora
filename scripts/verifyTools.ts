@@ -24,6 +24,7 @@ import {
   getCartDetailsTool,
   markCartOutcomeTool,
   markCartPaidTool,
+  removeCartItemTool,
   selectAlternativeTool,
 } from '../src/lib/tools';
 
@@ -294,6 +295,49 @@ console.log('\ngetActiveSales — only genuinely on-sale, in-stock items, option
     all.items.every((i) => i.itemId !== 'K-CO-02'),
     'a discontinued item is never listed as an active sale even if flagged on sale',
   );
+}
+
+console.log('\nremoveCartItem — drops one line from a multi-item cart, checkout prices the REDUCED value (CART-002)');
+{
+  let list = [...carts];
+  const before = list.find((c) => c.cartId === 'CART-002')!;
+  assert(before.items.length === 2, 'sanity: CART-002 starts with two items');
+  assert(amountPaidForCart(before) === 3299 + 1299, 'sanity: original combined value is co-ord + top');
+
+  const removed = removeCartItemTool(list, 'CART-002', 'K-TOP-01');
+  assert(removed.output.success === true, 'removes the top, keeping the co-ord set');
+  assert(removed.output.newCartValue === 3299, 'reports the REDUCED value (co-ord set only), not the original combined total');
+  list = list.map((c) => (c.cartId === 'CART-002' ? (removed.cart as (typeof list)[number]) : c));
+
+  const shrunk = list.find((c) => c.cartId === 'CART-002')!;
+  assert(shrunk.items.length === 1 && shrunk.items[0].itemId === 'K-CO-01', 'cart.items actually shrank to just the co-ord set');
+  assert(amountPaidForCart(shrunk) === 3299, 'derived amount now reflects the REDUCED cart, not the original ₹4598');
+
+  const checkout = createCheckoutLinkTool(list, 'CART-002', CHECKOUT_BASE_URL);
+  assert(checkout.output.success === true, 'checkout succeeds after removal');
+  assert(checkout.output.finalAmount === 3299, 'createCheckoutLink prices the CURRENT (post-removal) cart, not the original ₹4598');
+}
+
+console.log('\nremoveCartItem — refuses to drop the last remaining item (must use markCartOutcome instead)');
+{
+  const res = removeCartItemTool(carts, 'CART-001', 'K-KUR-01');
+  assert(res.output.success === false, 'refused — would leave zero items');
+  assert(res.cart === null, 'no state change on refusal');
+}
+
+console.log('\nremoveCartItem — refuses an itemId that is not actually in the cart');
+{
+  const res = removeCartItemTool(carts, 'CART-002', 'K-SHW-01');
+  assert(res.output.success === false, 'refused — that item was never in this cart');
+}
+
+console.log('\nremoveCartItem — refuses once a checkout link already exists');
+{
+  let list = [...carts];
+  const link = createCheckoutLinkTool(list, 'CART-002', CHECKOUT_BASE_URL);
+  list = list.map((c) => (c.cartId === 'CART-002' ? (link.cart as (typeof list)[number]) : c));
+  const res = removeCartItemTool(list, 'CART-002', 'K-TOP-01');
+  assert(res.output.success === false, 'refused — items can no longer change after checkout');
 }
 
 console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`}`);

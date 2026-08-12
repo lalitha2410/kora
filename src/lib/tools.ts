@@ -1,5 +1,6 @@
 import type { AbandonedCart, CartOutcome, CatalogItem, LlmSettableOutcome } from '../types';
 import { catalog, getCatalogItem } from '../data/catalog';
+import { getCustomerProfile } from '../data/customers';
 import { amountPaidForCart, checkDiscountEligibility, resolveCart } from './pricingPolicy';
 
 /**
@@ -522,6 +523,283 @@ export function selectAlternativeTool(
     cart: updated,
     output: { success: true, itemId: product.itemId, name: product.name, price: product.price, size, colour: product.colour },
   };
+}
+
+// ---------------------------------------------------------------------
+// removeCartItem — drops ONE line from a multi-item cart when the customer
+// only wants part of what's in it (e.g. "just the co-ord set, not the
+// top" on CART-002's two-item cart). Same reasoning as selectAlternative's
+// own doc: without this, the cart's `items` array never actually changes,
+// so createCheckoutLink/resolveCart keep pricing (and the dashboard keeps
+// crediting) the FULL original cart even after the customer said they only
+// want part of it. Because amountPaidForCart/resolveCart always derive
+// fresh from `cart.items` (never a stored total), updating `items` here is
+// the ENTIRE fix — checkout, revenue attribution, and the dashboard's cart
+// value all pick up the reduced set automatically, no separate figure to
+// keep in sync.
+// ---------------------------------------------------------------------
+
+export interface RemoveCartItemOutput {
+  success: boolean;
+  error?: string;
+  removedItemId?: string;
+  removedName?: string;
+  remainingItems?: { itemId: string; name: string; size: string; colour: string; quantity: number }[];
+  newCartValue?: number;
+}
+
+export function removeCartItemTool(
+  carts: AbandonedCart[],
+  cartId: string,
+  itemId: string,
+): ToolOutcome<RemoveCartItemOutput> {
+  const cart = findCart(carts, cartId);
+  if (!cart) return { cart: null, output: { success: false, error: 'Cart not found.' } };
+  if (cart.checkoutLink || cart.outcome === 'recovered' || cart.outcome === 'checkout_sent') {
+    return { cart: null, output: { success: false, error: 'A checkout link already exists for this cart — items can no longer be changed.' } };
+  }
+
+  const line = cart.items.find((l) => l.itemId === itemId);
+  if (!line) {
+    return { cart: null, output: { success: false, error: `Item ${itemId} is not in this cart — nothing to remove.` } };
+  }
+  // A cart must always end up with at least one line — dropping the last
+  // one isn't "a smaller cart," it's "no sale," which is markCartOutcome's
+  // job (see systemPrompt.ts's multi-item rule), not this tool's.
+  if (cart.items.length <= 1) {
+    return {
+      cart: null,
+      output: {
+        success: false,
+        error: 'This cart only has one item left — removing it would leave nothing to check out. If the customer wants none of it, use markCartOutcome("lost") instead.',
+      },
+    };
+  }
+
+  const remainingLines = cart.items.filter((l) => l.itemId !== itemId);
+  const updated: AbandonedCart = {
+    ...cart,
+    items: remainingLines,
+    // Same reasoning as selectAlternativeTool: a discount minted against
+    // the FULL cart's value is no longer valid once the cart shrinks.
+    discountOffered: false,
+    discountPercent: undefined,
+    discountCode: undefined,
+  };
+  const removedProduct = getCatalogItem(itemId);
+  const resolved = resolveCart(updated);
+  return {
+    cart: updated,
+    output: {
+      success: true,
+      removedItemId: itemId,
+      removedName: removedProduct?.name ?? itemId,
+      remainingItems: remainingLines.map((l) => {
+        const p = getCatalogItem(l.itemId);
+        return { itemId: l.itemId, name: p?.name ?? 'Unknown item', size: l.size, colour: l.colour, quantity: l.quantity };
+      }),
+      newCartValue: resolved.cartValue,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------
+// getRecommendationsFromHistory — Trigger 1 (recommendations; a
+// replenishment trigger was built and then deliberately removed — fashion
+// isn't a consumables vertical, see types.ts's CampaignType doc — so
+// numbering here starts at 1, not 2). Read-only,
+// same "structurally unable to invent a product" guarantee as
+// findSimilarItems/findAlternativesBy*: every result is a `.filter()` over
+// the real `catalog`, gated on real purchase history from
+// data/customers.ts. Returns `items` (not `recommendations`) deliberately
+// — same field name findSimilarItems/getActiveSales/etc use, so
+// useCartRecoveryAgent.ts's existing ALTERNATIVE_TOOLS handling (pendingOptions,
+// presented-before-selectable, selectAlternative reuse) picks this tool up
+// for free, no new state-machine code required.
+// ---------------------------------------------------------------------
+
+/** Which categories a purchase in the key category genuinely complements —
+ * deliberately narrow and hand-curated (not "everything in stock"), so a
+ * recommendation always has an honest "why" a reply can state, not just a
+ * coincidental price match. */
+const COMPLEMENTARY_CATEGORIES: Record<string, string[]> = {
+  Kurta: ['Trousers', 'Accessory'],
+  Top: ['Trousers', 'Accessory'],
+  Trousers: ['Top', 'Kurta'],
+  Dress: ['Accessory'],
+  Saree: ['Accessory'],
+  'Co-ord Set': ['Accessory'],
+  Occasion: ['Accessory'],
+  Innerwear: [],
+  Accessory: [],
+};
+
+export interface RecommendationItem {
+  itemId: string;
+  name: string;
+  category: string;
+  price: number;
+  fabric: string;
+  colour: string;
+  /** The real past purchase this recommendation is grounded in — lets a
+   * reply honestly say "since you got the X…" instead of presenting the
+   * suggestion as coming from nowhere. */
+  becauseOf: string;
+}
+
+export interface GetRecommendationsFromHistoryOutput {
+  success: boolean;
+  items: RecommendationItem[];
+}
+
+/**
+ * GUARDS, all enforced here rather than left to the model:
+ *  - every candidate comes from the real `catalog` array, filtered against
+ *    a real PurchaseRecord — nothing here is ever invented.
+ *  - never recommends an item the customer already owns (ownedItemIds).
+ *  - never exceeds `typicalSpend.max` — the explicit "don't push a ₹12,999
+ *    piece at someone who buys ₹1,500 items" rule.
+ *  - filtered to `sizeProfile` when a size is known for that category, AND
+ *    that size must genuinely be in stock (not just listed) — same
+ *    standard findAlternativesBySize already holds itself to.
+ *  - only same-category or explicitly complementary-category items ever
+ *    qualify (COMPLEMENTARY_CATEGORIES) — "genuinely complement or follow
+ *    from" is enforced structurally, not left to the model's judgment.
+ * No purchase history at all returns success with an empty list — nothing
+ * to recommend, not a failure (see data/customers.ts's Naomi Fernandes).
+ */
+export function getRecommendationsFromHistoryTool(customerId: string): GetRecommendationsFromHistoryOutput {
+  const profile = getCustomerProfile(customerId);
+  if (!profile || profile.purchaseHistory.length === 0) return { success: true, items: [] };
+
+  const ownedItemIds = new Set(profile.purchaseHistory.map((p) => p.itemId));
+  const seen = new Set<string>();
+  const items: RecommendationItem[] = [];
+
+  const purchasesByRecency = [...profile.purchaseHistory].sort((a, b) => b.purchaseDate - a.purchaseDate);
+  for (const purchase of purchasesByRecency) {
+    const source = getCatalogItem(purchase.itemId);
+    if (!source) continue;
+
+    const candidates = catalog.filter((p) => {
+      if (p.itemId === source.itemId || ownedItemIds.has(p.itemId) || seen.has(p.itemId)) return false;
+      if (!p.inStock || p.price > profile.typicalSpend.max) return false;
+      const sameOrComplementary = p.category === source.category || (COMPLEMENTARY_CATEGORIES[source.category] ?? []).includes(p.category);
+      if (!sameOrComplementary) return false;
+      const knownSize = profile.sizeProfile[p.category];
+      if (knownSize && (!p.sizes.includes(knownSize) || p.outOfStockSizes.includes(knownSize))) return false;
+      return true;
+    });
+
+    for (const c of candidates.slice(0, 2)) {
+      items.push({ itemId: c.itemId, name: c.name, category: c.category, price: c.price, fabric: c.fabric, colour: c.colour, becauseOf: source.name });
+      seen.add(c.itemId);
+    }
+    if (items.length >= 3) break;
+  }
+
+  return { success: true, items: items.slice(0, 3) };
+}
+
+// ---------------------------------------------------------------------
+// getBrowseAbandonment — Trigger 2 (browse-and-abandon). Read-only, same
+// real-data-only guarantee as everything above; every result traces back
+// to a real BrowseEvent in data/customers.ts.
+// ---------------------------------------------------------------------
+
+/** Fewer than this many views isn't a pattern worth reaching out about. */
+const BROWSE_VIEW_THRESHOLD = 3;
+/** Minimum days since the last view before a nudge is offered — the
+ * "cooling-off period so it isn't creepy" the trigger explicitly asks for:
+ * reaching out the moment someone looks at something reads as active
+ * surveillance, not a helpful nudge. */
+const BROWSE_COOLING_OFF_DAYS = 2;
+/** Beyond this many days the interest itself is presumed stale — an old
+ * browse streak isn't still "abandonment" months later. */
+const BROWSE_STALE_DAYS = 30;
+
+export interface BrowseAbandonmentItem {
+  itemId: string;
+  name: string;
+  category: string;
+  price: number;
+  colour: string;
+  viewCount: number;
+  daysSinceLastView: number;
+}
+
+export interface GetBrowseAbandonmentOutput {
+  success: boolean;
+  items: BrowseAbandonmentItem[];
+}
+
+/**
+ * GUARDS, all enforced here rather than left to the model:
+ *  - `converted` browse events (this exact viewing streak already ended in
+ *    a purchase) are excluded outright.
+ *  - any item that appears ANYWHERE in this customer's purchase history is
+ *    excluded too — a real sale, even one this specific BrowseEvent wasn't
+ *    marked as causing, is never treated as an open abandonment.
+ *  - any item currently sitting in one of this customer's OTHER carts with
+ *    a still-open outcome ('active' or 'checkout_sent') is excluded — "not
+ *    in an active cart" per the trigger's own rule; `allCarts` is passed
+ *    in specifically so this can check across EVERY campaign thread for
+ *    this customer, not just the one this tool call happens to be running
+ *    inside.
+ *  - fewer than BROWSE_VIEW_THRESHOLD views, or a last view inside the
+ *    cooling-off window, or one old enough to be stale, are all excluded.
+ * Opt-out itself is deliberately NOT checked here — see tools.ts's
+ * file-level guard comment: any tool call at all only ever happens inside
+ * a reply to a message the customer just sent, so it's already
+ * customer-initiated by construction: the same reasoning that lets
+ * getCartDetails/checkDiscountEligibility keep working normally on an
+ * opted-out cart-recovery thread applies unchanged here.
+ */
+export function getBrowseAbandonmentTool(customerId: string, allCarts: AbandonedCart[]): GetBrowseAbandonmentOutput {
+  const profile = getCustomerProfile(customerId);
+  if (!profile) return { success: true, items: [] };
+
+  const purchasedItemIds = new Set(profile.purchaseHistory.map((p) => p.itemId));
+  // Scoped to campaignType === 'cart_recovery' specifically — that's the
+  // only campaign type where `items` means "the customer genuinely put
+  // this in a cart." The other three types (including a browse-abandonment
+  // thread's own thread about THIS item) merely propose an item; without
+  // this scoping, a browse-abandonment cart's own seeded item excluded
+  // itself from its own guard the moment this tool ran against it — found
+  // live via scripts/verifyCampaignTriggers.ts, Meher Khanna's CART-106.
+  const inOpenCartItemIds = new Set(
+    allCarts
+      .filter(
+        (c) =>
+          c.customerId === customerId &&
+          c.campaignType === 'cart_recovery' &&
+          (c.outcome === 'active' || c.outcome === 'checkout_sent'),
+      )
+      .flatMap((c) => c.items.map((i) => i.itemId)),
+  );
+
+  const now = Date.now();
+  const items: BrowseAbandonmentItem[] = [];
+  for (const ev of profile.browseEvents) {
+    if (ev.converted) continue;
+    if (ev.viewCount < BROWSE_VIEW_THRESHOLD) continue;
+    if (purchasedItemIds.has(ev.itemId)) continue;
+    if (inOpenCartItemIds.has(ev.itemId)) continue;
+    const daysSinceLastView = Math.floor((now - ev.timestamp) / 86_400_000);
+    if (daysSinceLastView < BROWSE_COOLING_OFF_DAYS || daysSinceLastView > BROWSE_STALE_DAYS) continue;
+    const product = getCatalogItem(ev.itemId);
+    if (!product || !product.inStock) continue;
+    items.push({
+      itemId: product.itemId,
+      name: product.name,
+      category: product.category,
+      price: product.price,
+      colour: product.colour,
+      viewCount: ev.viewCount,
+      daysSinceLastView,
+    });
+  }
+  return { success: true, items };
 }
 
 // ---------------------------------------------------------------------

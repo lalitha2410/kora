@@ -4,13 +4,18 @@ import type { CampaignStats } from '../hooks/useCartRecoveryAgent';
 const rupee = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
 
 /**
- * The remaining numbers, deliberately demoted relative to HeroStats — no
- * clay coloring on the figures (that's reserved for the two hero numbers),
- * just plain paper-toned text on the same `inkRaised` card surface as the
- * funnel and hero cards. A dense inline strip, not an equal-weight tile
- * grid — the "denser data, more numeric emphasis" register a
- * growth/analytics tool reads in, as opposed to the returns console's row
- * of identical white bordered tiles.
+ * Only the numbers that AREN'T already visible somewhere else on this
+ * panel. This used to be six tiles — Carts targeted, Messages sent, and
+ * Replies received were duplicates of the funnel's first three bars
+ * (Targeted/Messaged/Replied), just re-stated as bare numbers a few
+ * pixels below the bars that already show them. Found live: two hero
+ * cards, a five-row funnel, six secondary tiles, and the outcomes table
+ * were all competing for the same width — cut to the three figures that
+ * genuinely don't exist anywhere else on this panel.
+ *
+ * Deliberately demoted relative to HeroStats — no accent coloring on the
+ * figures (that's reserved for the two hero numbers), just `ink` text on
+ * the same `paperRaised` card surface as the funnel and hero cards.
  *
  * Hairlines between cells are a `gap-px` trick (parent painted the divider
  * tint, each cell painted the card color over it) rather than Tailwind's
@@ -20,17 +25,17 @@ const rupee = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR
  */
 function Metric({ label, value, colors, title }: { label: string; value: string; colors: BrandColors; title?: string }) {
   return (
-    <div className="min-w-0 px-3 py-2" style={{ backgroundColor: colors.inkRaised }} title={title}>
+    <div className="min-w-0 px-3 py-2" style={{ backgroundColor: colors.paperRaised }} title={title}>
       <p
         className="truncate text-[9.5px] font-medium uppercase tracking-[0.06em]"
-        style={{ color: `${colors.paper}77` }}
+        style={{ color: `${colors.ink}77` }}
         title={label}
       >
         {label}
       </p>
       <p
         className="mt-0.5 truncate font-mono text-[14px] font-semibold leading-tight"
-        style={{ color: colors.paper }}
+        style={{ color: colors.ink }}
       >
         {value}
       </p>
@@ -41,12 +46,9 @@ function Metric({ label, value, colors, title }: { label: string; value: string;
 export function SecondaryStats({ stats, colors }: { stats: CampaignStats; colors: BrandColors }) {
   return (
     <div
-      className="mx-3 grid grid-cols-2 gap-px overflow-hidden rounded-md sm:grid-cols-3 lg:grid-cols-6"
-      style={{ backgroundColor: `${colors.paper}1F` }}
+      className="mx-3 grid grid-cols-3 gap-px overflow-hidden rounded-md"
+      style={{ backgroundColor: `${colors.ink}0F`, boxShadow: `0 0 0 1px ${colors.ink}0F` }}
     >
-      <Metric label="Carts targeted" value={String(stats.cartsTargeted)} colors={colors} />
-      <Metric label="Messages sent" value={String(stats.messagesSent)} colors={colors} />
-      <Metric label="Replies received" value={String(stats.repliesReceived)} colors={colors} />
       {/* A link existing is intent, not revenue — see CartOutcome's own
           doc. Deliberately separate from "Revenue recovered" (HeroStats),
           which only ever counts confirmed payments. */}

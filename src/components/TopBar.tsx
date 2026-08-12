@@ -11,7 +11,7 @@ export function TopBar({ brand, onReset }: TopBarProps) {
       <div className="flex min-w-0 items-center gap-2 sm:gap-2.5">
         <div
           className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[13px] font-bold text-white sm:h-8 sm:w-8 sm:text-sm"
-          style={{ backgroundColor: brand.colors.primary }}
+          style={{ backgroundColor: brand.colors.accentDark }}
         >
           {brand.logoMark}
         </div>

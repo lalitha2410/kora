@@ -3,9 +3,35 @@ import type { BrandConfig } from '../config/brand';
 import type { AbandonedCart, ChatMessage } from '../types';
 import { scenarios } from '../data/scenarios';
 import { getActiveProvider } from '../lib/llmProvider';
-import { firstItemAndExtraCount } from '../lib/cartDisplay';
 import { ChatBubble, StreamingBubble, TypingIndicator } from './ChatBubble';
-import { ItemsBadge } from './ItemsBadge';
+
+/**
+ * WhatsApp Business verified-badge convention — the small scalloped blue
+ * seal next to a confirmed business name (see e.g. LimeChat's own demos,
+ * which show "Mahindra Auto ✓" as the thread header, or the classic
+ * Twitter/Meta verified seal this shape borrows from). Blue rather than
+ * the brand's own rose accent deliberately: this needs to read as "a
+ * genuine WhatsApp Business badge," not a custom brand touch, the same
+ * reason the bubbles/ticks/wallpaper below are real WhatsApp colours
+ * rather than brand ones.
+ *
+ * The scalloped outline (not a plain circle) is what actually reads as
+ * "verified seal" rather than just "blue dot" — three 14×14 rounded
+ * squares layered 30° apart give 12 evenly-spaced points, the same
+ * overlapping-square construction real verified badges use.
+ */
+function VerifiedBadge() {
+  return (
+    <svg viewBox="0 0 20 20" width="14" height="14" className="shrink-0" aria-label="Verified business account">
+      <g fill="#55ACEE">
+        <rect x="3" y="3" width="14" height="14" rx="4" />
+        <rect x="3" y="3" width="14" height="14" rx="4" transform="rotate(30 10 10)" />
+        <rect x="3" y="3" width="14" height="14" rx="4" transform="rotate(60 10 10)" />
+      </g>
+      <path d="M6.2 10.3 8.7 12.8 13.8 7.5" fill="none" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
 
 interface ChatPanelProps {
   brand: BrandConfig;
@@ -60,7 +86,6 @@ export function ChatPanel({
   const conversationClosed = activeCart.outcome === 'recovered' || activeCart.outcome === 'lost';
   const isOptedOut = activeCart.outcome === 'opted_out';
   const inputDisabled = disabled || conversationClosed;
-  const headerItems = firstItemAndExtraCount(activeCart);
 
   function submit(text: string) {
     const trimmed = text.trim();
@@ -70,25 +95,28 @@ export function ChatPanel({
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[#ece5dd]">
+    <div className="flex h-full min-h-0 flex-col" style={{ backgroundColor: brand.colors.chatWallpaper }}>
       <div className="flex items-center gap-2.5 bg-[#f0f2f5] px-3 py-2 shadow-sm">
         <div
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[15px] font-semibold text-white"
-          style={{ backgroundColor: brand.colors.primary }}
+          style={{ backgroundColor: brand.colors.accentDark }}
         >
-          {brand.agentName.charAt(0)}
+          {brand.logoMark}
         </div>
+        {/* This is the customer's view of a WhatsApp Business thread —
+            they're messaging the BRAND's account, so the header identifies
+            Kora, not whichever cart happens to be active. The customer's
+            own name/item/city are already visible in the cart dropdown to
+            the right and the campaign table on the other panel; showing
+            them here too was never how a real WhatsApp Business header
+            works — it doesn't know or show anything about "who else this
+            business talks to." */}
         <div className="min-w-0 flex-1">
-          <p className="truncate text-[14.5px] font-medium leading-tight text-[#111b21]">{activeCart.customerName}</p>
-          {isTyping ? (
-            <p className="truncate text-[12px] leading-tight text-[#667781]">typing…</p>
-          ) : (
-            <div className="flex min-w-0 items-center gap-1 text-[12px] leading-tight text-[#667781]">
-              <span className="min-w-0 truncate">{headerItems.first}</span>
-              <ItemsBadge cart={activeCart} colors={brand.colors} surface="whatsapp" />
-              <span className="shrink-0 text-[#8696a0]">· {activeCart.city}</span>
-            </div>
-          )}
+          <div className="flex min-w-0 items-center gap-1">
+            <p className="truncate text-[14.5px] font-medium leading-tight text-[#111b21]">{brand.name}</p>
+            <VerifiedBadge />
+          </div>
+          <p className="truncate text-[12px] leading-tight text-[#667781]">{isTyping ? 'typing…' : 'Business account'}</p>
         </div>
 
         <select
@@ -187,7 +215,7 @@ export function ChatPanel({
           type="submit"
           disabled={inputDisabled || !draft.trim()}
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-white disabled:opacity-40"
-          style={{ backgroundColor: brand.colors.primary }}
+          style={{ backgroundColor: brand.colors.accentDark }}
           aria-label="Send"
         >
           <svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor">

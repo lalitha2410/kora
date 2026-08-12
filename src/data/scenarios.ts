@@ -8,15 +8,26 @@ export interface Scenario {
 }
 
 /**
- * Eleven scripted objection paths for "Play scenario," each pinned to a
- * specific seeded cart so the outcome is deterministic (see data/carts.ts
- * for why each cart was picked — margin floor, on-sale flag, recency,
- * size/colour/budget setup, etc). Four exercise the smarter-alternative
- * tools (findAlternativesBySize/ByBudget/ByColour, getActiveSales) added
- * alongside the multi-provider/context-window hardening; the last one
- * exercises the directional opt-out fix — a cart that opts out and then
- * messages back in on its own, on a DIFFERENT cart than the plain opt_out
- * scenario above so the two never interact.
+ * Sixteen scripted paths for "Play scenario," each pinned to a specific
+ * seeded cart so the outcome is deterministic (see data/carts.ts for why
+ * each cart was picked — margin floor, on-sale flag, recency, size/colour/
+ * budget setup, etc). Four exercise the smarter-alternative tools
+ * (findAlternativesBySize/ByBudget/ByColour, getActiveSales) added
+ * alongside the multi-provider/context-window hardening; one exercises the
+ * directional opt-out fix — a cart that opts out and then messages back in
+ * on its own, on a DIFFERENT cart than the plain opt_out scenario above so
+ * the two never interact; one exercises removeCartItem on CART-002 (the
+ * only multi-item cart in the seed data), keeping just one of its two
+ * items and confirming checkout prices the REDUCED cart, not the original
+ * combined value.
+ *
+ * The last four cover the two newer campaign triggers (see
+ * data/customers.ts, tools.ts's getRecommendationsFromHistory/
+ * getBrowseAbandonment), each with both an accept path AND a decline path —
+ * the "handle the no" requirement is exercised just as deliberately as the
+ * "handle the yes" one for every trigger. (A third trigger, replenishment,
+ * was built and then deliberately removed — see types.ts's CampaignType
+ * doc — which included its own three scenarios, no longer here.)
  */
 export const scenarios: Scenario[] = [
   {
@@ -95,6 +106,15 @@ export const scenarios: Scenario[] = [
     ],
   },
   {
+    id: 'multi_item_partial_selection',
+    label: 'Multi-item cart → keeps only one item',
+    cartId: 'CART-002',
+    customerTurns: [
+      "Hi! Actually I only really want the co-ord set, not the top.",
+      "Yes please, go ahead and send me the checkout link for that.",
+    ],
+  },
+  {
     id: 'opt_out_then_reengage',
     label: 'Opts out, then messages back in and buys',
     cartId: 'CART-012',
@@ -103,6 +123,41 @@ export const scenarios: Scenario[] = [
       "Actually, sorry — I changed my mind. Is the shawl still available? I'd like to get it after all.",
       "Great, send me the checkout link please.",
     ],
+  },
+
+  // -----------------------------------------------------------------
+  // TRIGGER 1: RECOMMENDATIONS FROM HISTORY
+  // -----------------------------------------------------------------
+  {
+    id: 'recommendation_accept',
+    label: 'Recommendation → accepts and buys',
+    cartId: 'CART-104',
+    customerTurns: ["Oh that's a great idea, they'd go really well together — yes, send it over!"],
+  },
+  {
+    id: 'recommendation_decline',
+    label: 'Recommendation → politely declines',
+    cartId: 'CART-105',
+    customerTurns: ["It's nice but I don't think I need it right now, thank you though!"],
+  },
+
+  // -----------------------------------------------------------------
+  // TRIGGER 2: BROWSE-AND-ABANDON
+  // -----------------------------------------------------------------
+  {
+    id: 'browse_abandonment_accept',
+    label: 'Browse-abandon → asks a question, then buys',
+    cartId: 'CART-106',
+    customerTurns: [
+      "Oh I have been eyeing that one! Does it run true to size?",
+      "Great, I'll take it — please send the checkout link.",
+    ],
+  },
+  {
+    id: 'browse_abandonment_decline',
+    label: "Browse-abandon → \"just looking\"",
+    cartId: 'CART-107',
+    customerTurns: ["Thanks, I'm honestly just looking around for now, not ready to buy yet."],
   },
 ];
 

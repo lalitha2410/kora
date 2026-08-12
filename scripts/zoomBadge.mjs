@@ -1,0 +1,12 @@
+import { chromium } from 'playwright';
+const outDir = String.raw`C:\Users\kamal\AppData\Local\Temp\claude\c--Users-kamal-Desktop-react-projects-CartRecovery\706691fd-341c-42e8-a9a7-bf222be9c4a6\scratchpad`;
+const outName = process.argv[2] ?? 'badge';
+const port = process.argv[3] ?? '5173';
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 900, height: 300 }, deviceScaleFactor: 3 });
+await page.goto(`http://localhost:${port}/`, { waitUntil: 'networkidle' });
+await page.click('text=Got it').catch(() => {});
+await page.waitForTimeout(400);
+await page.screenshot({ path: `${outDir}/${outName}.png`, clip: { x: 8, y: 44, width: 240, height: 44 } });
+await browser.close();
+console.log(`Saved ${outName}.png`);

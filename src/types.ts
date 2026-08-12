@@ -61,8 +61,38 @@ export type CartOutcome = 'active' | 'checkout_sent' | 'recovered' | 'lost' | 'o
  * CartOutcome's own doc for why 'recovered' isn't among them. */
 export type LlmSettableOutcome = 'lost' | 'opted_out';
 
+/**
+ * Which campaign produced this conversation thread. 'cart_recovery' is the
+ * original (and only implicit) type every pre-existing seeded cart carries.
+ * The other two are the newer profile-driven triggers — see
+ * data/customers.ts and tools.ts's getRecommendationsFromHistory/
+ * getBrowseAbandonment. Deliberately a tag on the SAME AbandonedCart shape
+ * rather than a parallel type: every trigger here reduces to "one seeded
+ * outbound WhatsApp thread about one real catalog item, with the same
+ * intent -> checkout-link -> paid state machine underneath" (see
+ * CartOutcome), so reusing the existing provider-fallback/fact-tracking/
+ * guardrail/pricing infrastructure as-is is both less code and a genuine
+ * architectural fit, not a shortcut.
+ *
+ * A 'replenishment' trigger (repeat-purchase nudges for everyday basics)
+ * was built and then deliberately removed — fashion isn't a consumables
+ * vertical, and a "you're due for a reorder" nudge fit Kora's own catalog
+ * far more awkwardly than the other two triggers. See the README's Design
+ * decisions for the fuller note.
+ */
+export type CampaignType = 'cart_recovery' | 'recommendation' | 'browse_abandonment';
+
 export interface AbandonedCart {
   cartId: string;
+  /** Defaults to 'cart_recovery' for every pre-existing seeded cart — see
+   * CampaignType's own doc. */
+  campaignType: CampaignType;
+  /** Joins this thread to a data/customers.ts CustomerProfile — always the
+   * same value as `phone` below (customers are looked up by phone in this
+   * demo), kept as its own named field so tools.ts's new profile-driven
+   * tools don't have to reach for `.phone` and rediscover that convention
+   * on their own. */
+  customerId: string;
   customerName: string;
   phone: string;
   city: string;
@@ -118,9 +148,29 @@ export interface AbandonedCart {
   };
 }
 
+/** A real catalog product, reduced to what a WhatsApp media-message bubble
+ * needs to render — see lib/productImages.ts's productImageFor, the ONLY
+ * place one of these is ever constructed. Always built from a real
+ * data/catalog.ts entry; never something a ChatMessage author (LLM or
+ * otherwise) supplies free-text, so a message can never claim to show a
+ * product image that isn't real. */
+export interface ProductImage {
+  itemId: string;
+  name: string;
+  price: number;
+  imageUrl: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'agent' | 'system';
   text: string;
   timestamp: number;
+  /** Present only on a message that IS a product presentation — a real
+   * catalog item's picture, rendered as its own WhatsApp media bubble (see
+   * ChatBubble.tsx). Attached entirely in code from an actual tool result
+   * this turn (see useCartRecoveryAgent.ts's sendMessage), never inferred
+   * from the LLM's reply text — the model has no way to attach or
+   * fabricate one. */
+  image?: ProductImage;
 }

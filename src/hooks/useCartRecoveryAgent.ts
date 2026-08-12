@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { BrandConfig } from '../config/brand';
 import { koraBrand } from '../config/brand';
-import type { AbandonedCart, CartOutcome, ChatMessage, LlmSettableOutcome } from '../types';
+import type { AbandonedCart, CampaignType, CartLineItem, CartOutcome, ChatMessage, LlmSettableOutcome, ProductImage } from '../types';
 import {
   getActiveProvider,
   hasApiKey,
@@ -21,13 +21,17 @@ import {
   findSimilarItemsTool,
   generateDiscountCodeTool,
   getActiveSalesTool,
+  getBrowseAbandonmentTool,
   getCartDetailsTool,
+  getRecommendationsFromHistoryTool,
   markCartOutcomeTool,
   markCartPaidTool,
+  removeCartItemTool,
   selectAlternativeTool,
 } from '../lib/tools';
 import { amountPaidForCart, resolveCart } from '../lib/pricingPolicy';
 import { getCatalogItem } from '../data/catalog';
+import { productImageCaption, productImageFor } from '../lib/productImages';
 import type { Scenario } from '../data/scenarios';
 
 /**
@@ -61,8 +65,11 @@ const TOOL_ACTIVITY_LABELS: Record<string, string> = {
   findAlternativesByColour: 'Searching other colours…',
   getActiveSales: 'Checking active sales…',
   selectAlternative: 'Updating cart to your pick…',
+  removeCartItem: 'Updating cart to what you want…',
   createCheckoutLink: 'Creating checkout link…',
   markCartOutcome: 'Updating cart outcome…',
+  getRecommendationsFromHistory: 'Finding recommendations…',
+  getBrowseAbandonment: 'Checking browsing history…',
 };
 
 const THINKING_LABEL = 'Reading customer reply…';
@@ -77,8 +84,15 @@ interface ThreadState {
 function buildInitialThreads(catalog: AbandonedCart[]): Record<string, ThreadState> {
   const out: Record<string, ThreadState> = {};
   for (const cart of catalog) {
+    // The opening message is authored copy that already names this cart's
+    // own item (see data/carts.ts) — attaching its real catalog image here
+    // is the one place an image is set outside a live tool call, and it's
+    // still built the same way (productImageFor, never invented).
+    const openingImage = cart.items[0] ? productImageFor(cart.items[0].itemId) : undefined;
     out[cart.cartId] = {
-      messages: [{ id: uid(), role: 'agent', text: cart.openingMessage, timestamp: cart.abandonedAt + 1000 }],
+      messages: [
+        { id: uid(), role: 'agent', text: cart.openingMessage, timestamp: cart.abandonedAt + 1000, image: openingImage },
+      ],
       isTyping: false,
       toolActivity: null,
       streamingText: '',
@@ -178,9 +192,49 @@ interface ConversationFacts {
    * `items` array doesn't change until the tool actually runs; this tracks
    * that gap so it can be forced closed before anything else happens. */
   alternativeSelectionApplied?: boolean;
+  /** Set by resolvePartialCartRemoval the moment free text unambiguously
+   * identifies which line of a MULTI-ITEM cart the customer wants dropped
+   * — e.g. "I only want the co-ord set, not the top." Resolved in code
+   * from the cart's own real items, never trusted from the model's own
+   * argument alone — same "a captured selection wins over a hallucinated
+   * argument" rule selectedAlternativeItemId already follows. Holds the
+   * itemId to REMOVE. */
+  pendingCartItemRemoval?: string;
+  pendingCartItemRemovalName?: string;
+  /** True once removeCartItem has actually run for the CURRENT
+   * pendingCartItemRemoval — see requiredCartItemRemovalTool. Same gap as
+   * alternativeSelectionApplied: the code knows what the customer wants
+   * dropped before the cart's own `items` array actually reflects it. */
+  cartItemRemovalApplied?: boolean;
   checkoutLinkCreated?: boolean;
   checkoutLink?: string;
   outcomeSet?: CartOutcome;
+  /** Trigger 2's fact-lookup flag — same "don't re-fetch/re-ask" purpose
+   * as cartDetailsChecked above, just for the one profile-driven tool that
+   * isn't part of the original checkout FLOW. Recommendations (Trigger 1)
+   * need no flag of their own: getRecommendationsFromHistory is in
+   * ALTERNATIVE_TOOLS, so it already populates pendingOptions exactly like
+   * findSimilarItems/getActiveSales do. */
+  browseAbandonmentChecked?: boolean;
+  /** Every real INR amount this conversation has actually seen from a tool
+   * result (or from the customer's own stated budget) — cart items, cart
+   * value, alternatives, checkout/reorder amounts. Never cleared, since a
+   * price established several turns ago is still real several turns
+   * later. See recordPrice and looksLikeFabricatedPriceClaim: a ₹ figure
+   * in a reply that isn't in this list (or derivable from it — see
+   * buildAllowedPriceSet) is treated as invented. */
+  knownPrices?: number[];
+  /** Every real discount percentage this conversation has actually seen
+   * from checkDiscountEligibility/generateDiscountCode. See recordPercent
+   * and looksLikeFabricatedDiscountClaim. */
+  knownPercents?: number[];
+  /** True once getCartDetails has reported AT LEAST ONE of this cart's own
+   * line items as genuinely in stock (sizeInStock: true) — see
+   * looksLikeFabricatedAvailabilityClaim. Never cleared once set. */
+  cartAnyItemInStock?: boolean;
+  /** True once getCartDetails has reported AT LEAST ONE of this cart's own
+   * line items as genuinely NOT in stock (sizeInStock: false). */
+  cartAnyItemOutOfStock?: boolean;
 }
 
 type PendingQuestion = 'alternativeChoice';
@@ -455,6 +509,144 @@ function looksLikeFabricatedCheckoutLink(content: string, facts: ConversationFac
   return !urls.includes(real);
 }
 
+// ---------------------------------------------------------------------
+// CLAIM GUARD — found live: a reply quoted "₹3,290" for a cart whose real
+// value (getCartDetails' own return) was ₹4,499 — an entirely invented
+// number, no tool behind it — and separately, a different reply claimed a
+// size "isn't available" for an item whose getCartDetails result had
+// already said sizeInStock: true. Both are exactly the class of harm this
+// whole guardrail file exists to prevent — a customer acting on a price or
+// availability claim the brand never actually confirmed — worse than any
+// of the other fabrication classes already guarded against here, since a
+// customer could act on it directly (pay the wrong amount, give up on an
+// item that was actually available). recordPrice/recordPercent below are
+// called from updateFacts, for every tool result that ever returns a real
+// amount/percentage, so facts.knownPrices/knownPercents accumulate the
+// full set of numbers a reply is ever allowed to state — never cleared,
+// since a price established several turns ago is still real several turns
+// later.
+// ---------------------------------------------------------------------
+
+function recordPrice(facts: ConversationFacts, price: number | undefined): void {
+  if (price === undefined || !Number.isFinite(price)) return;
+  facts.knownPrices = facts.knownPrices ?? [];
+  if (!facts.knownPrices.includes(price)) facts.knownPrices.push(price);
+}
+
+function recordPercent(facts: ConversationFacts, percent: number | undefined): void {
+  if (percent === undefined || !Number.isFinite(percent)) return;
+  facts.knownPercents = facts.knownPercents ?? [];
+  if (!facts.knownPercents.includes(percent)) facts.knownPercents.push(percent);
+}
+
+const RUPEE_CLAIM_PATTERN = /₹\s?([\d,]+(?:\.\d+)?)/g;
+
+/**
+ * The real, tool-confirmed prices a reply is allowed to state, PLUS every
+ * price directly derivable from them — the discounted price and the
+ * savings amount for every known (price, percent) pair actually seen this
+ * conversation. Without the derived values, a perfectly correct "with 10%
+ * off, that's ₹1664" would trip the guard just as hard as a genuinely
+ * invented number, since no single tool call ever returns a pre-computed
+ * discounted total. Recomputed fresh each check (not cached in facts) —
+ * cheap, and always consistent with whatever knownPrices/knownPercents
+ * currently hold.
+ */
+function buildAllowedPriceSet(facts: ConversationFacts): Set<number> {
+  const prices = facts.knownPrices ?? [];
+  const percents = facts.knownPercents ?? [];
+  const allowed = new Set<number>(prices);
+  for (const p of prices) {
+    for (const d of percents) {
+      allowed.add(Math.round(p * (1 - d / 100)));
+      allowed.add(Math.round((p * d) / 100));
+    }
+  }
+  return allowed;
+}
+
+/**
+ * True when the reply states a ₹ amount that doesn't match any real price
+ * this conversation has actually seen (or a value directly derived from
+ * one — see buildAllowedPriceSet). Unconditional, checked on every reply
+ * regardless of whether a price objection was ever raised — see this
+ * section's own header comment for why a fabricated price is serious
+ * enough to warrant that, the same reasoning looksLikeFabricatedCheckoutLink
+ * already applies to invented URLs.
+ */
+function looksLikeFabricatedPriceClaim(content: string, facts: ConversationFacts): boolean {
+  const allowed = buildAllowedPriceSet(facts);
+  for (const m of content.matchAll(RUPEE_CLAIM_PATTERN)) {
+    const value = Number(m[1].replace(/,/g, ''));
+    if (Number.isFinite(value) && !allowed.has(value)) return true;
+  }
+  return false;
+}
+
+/**
+ * True when the reply states a discount percentage that doesn't match
+ * checkDiscountEligibility's maxDiscountPercent or generateDiscountCode's
+ * own discountPercent, ever returned this conversation. Deliberately
+ * scoped to percentages that actually read as a DISCOUNT claim (near
+ * "off"/"discount"/"code"/"save") rather than every bare "N%" in the
+ * text — this catalog's own fabric descriptions are full of legitimate,
+ * unrelated percentages ("100% pure linen", "100% cotton"), which would
+ * otherwise false-positive on nearly every reply that quotes fabric
+ * details exactly as the OBJECTIONS section asks it to.
+ */
+function looksLikeFabricatedDiscountClaim(content: string, facts: ConversationFacts): boolean {
+  const known = facts.knownPercents ?? [];
+  for (const m of content.matchAll(/(\d{1,3})\s?%/g)) {
+    const idx = m.index ?? 0;
+    const window = content.slice(Math.max(0, idx - 25), Math.min(content.length, idx + m[0].length + 15)).toLowerCase();
+    if (!/\b(off|discount|code|save)\b/.test(window)) continue;
+    const value = Number(m[1]);
+    if (Number.isFinite(value) && !known.includes(value)) return true;
+  }
+  return false;
+}
+
+const NEGATIVE_AVAILABILITY_PATTERN = /\b(isn'?t available|is not available|not currently available|no longer available|out of stock|unavailable|sold out)\b/i;
+const POSITIVE_AVAILABILITY_PATTERN = /\b(is available|is in stock|available in your size|currently available|still available|back in stock)\b/i;
+
+/**
+ * True when the reply asserts a stock/availability claim about this
+ * cart's own item(s) that contradicts what getCartDetails actually
+ * reported — found live: "Your size isn't available right now" for a
+ * line whose getCartDetails result had already said sizeInStock: true.
+ * Deliberately one-directional per branch (a NEGATIVE claim only trips
+ * when we know EVERY checked item was actually in stock; a POSITIVE claim
+ * only trips when we know something was actually out of stock and nothing
+ * was confirmed in stock) — a cart with a genuine mix of in-stock and
+ * out-of-stock lines shouldn't false-positive on a reply that correctly
+ * describes ONE of them. Scoped to the cart's own items specifically
+ * (never alternatives) since findAlternativesBySize/etc. can structurally
+ * only ever return items that ARE available — there's no equivalent risk
+ * there to guard against.
+ */
+function looksLikeFabricatedAvailabilityClaim(content: string, facts: ConversationFacts): boolean {
+  if (!facts.cartDetailsChecked) return false;
+  if (NEGATIVE_AVAILABILITY_PATTERN.test(content) && facts.cartAnyItemInStock && !facts.cartAnyItemOutOfStock) return true;
+  if (POSITIVE_AVAILABILITY_PATTERN.test(content) && facts.cartAnyItemOutOfStock && !facts.cartAnyItemInStock) return true;
+  return false;
+}
+
+/**
+ * Combines the three claim checks above — the single entry point
+ * buildTurnGuardrail actually calls. Kept as one function so the guardrail
+ * closure only needs one unconditional check (matching
+ * looksLikeFabricatedCheckoutLink's own placement), while each underlying
+ * heuristic stays independently named, documented, and (found-live)
+ * traceable to the specific failure it exists to catch.
+ */
+function looksLikeFabricatedClaim(content: string, facts: ConversationFacts): boolean {
+  return (
+    looksLikeFabricatedPriceClaim(content, facts) ||
+    looksLikeFabricatedDiscountClaim(content, facts) ||
+    looksLikeFabricatedAvailabilityClaim(content, facts)
+  );
+}
+
 /**
  * Which tool must run before anything else, when the customer just picked
  * a numbered/named alternative but the cart hasn't actually been swapped to
@@ -473,6 +665,17 @@ function requiredAlternativeSelectionTool(facts: ConversationFacts): string | un
 }
 
 /**
+ * Same priority tier as requiredAlternativeSelectionTool, for the same
+ * reason: resolvePartialCartRemoval (below) has already deterministically
+ * identified, in code, which line of a multi-item cart the customer wants
+ * dropped — nothing the model says can change that, so nothing downstream
+ * (pricing, checkout) is trustworthy until removeCartItem has actually run.
+ */
+function requiredCartItemRemovalTool(facts: ConversationFacts): string | undefined {
+  return facts.pendingCartItemRemoval && !facts.cartItemRemovalApplied ? 'removeCartItem' : undefined;
+}
+
+/**
  * Proactive enforcement: forces sendAgentMessage's very FIRST round of
  * this turn to call the required tool, before the model has had any
  * chance to reply at all. This is the unconditional half of price-
@@ -488,6 +691,8 @@ function requiredAlternativeSelectionTool(facts: ConversationFacts): string | un
 function buildInitialForcedTool(customerMessage: string, facts: ConversationFacts): string | undefined {
   const selectionTool = requiredAlternativeSelectionTool(facts);
   if (selectionTool) return selectionTool;
+  const removalTool = requiredCartItemRemovalTool(facts);
+  if (removalTool) return removalTool;
   if (!looksLikePriceObjection(customerMessage)) return undefined;
   return requiredPriceObjectionTool(facts);
 }
@@ -507,6 +712,10 @@ function buildInitialForcedTool(customerMessage: string, facts: ConversationFact
  *     requiredAlternativeSelectionTool. Takes priority over everything
  *     else; nothing downstream (pricing, checkout) is trustworthy while
  *     the cart still points at the wrong item.
+ *  1b. Same idea, for a multi-item cart — a partial-removal already
+ *     resolved in code but not yet applied (requiredCartItemRemovalTool).
+ *     Same priority tier as #1 for the same reason: the cart's contents
+ *     are wrong until this runs.
  *  2. Price objection, unresolved — requiredPriceObjectionTool(facts) is
  *     still non-empty AT THE MOMENT THE GUARDRAIL ACTUALLY RUNS (called
  *     inside the returned closure, not hoisted out and captured once:
@@ -531,12 +740,14 @@ function buildInitialForcedTool(customerMessage: string, facts: ConversationFact
  *     appears anywhere in the reply at all (see
  *     looksLikePriceObjectionNonAnswer). The catch-all, checked last.
  *
- * A 0th check, ahead of all of these, always runs regardless of any of the
- * conditions above: looksLikeFabricatedCheckoutLink. A hallucinated
- * checkout URL is a serious enough violation (a customer could click it)
- * that it can't be gated behind "this looked like a price objection" —
- * this is the one reason the closure is now always built, never skipped
- * for a cheap early return.
+ * Two 0th checks, ahead of all of these, always run regardless of any of
+ * the conditions above: looksLikeFabricatedCheckoutLink and
+ * looksLikeFabricatedClaim. A hallucinated checkout URL, price, discount
+ * percentage, or stock/size claim are all serious enough on their own (a
+ * customer could click a fake link, or act on a fake price or
+ * availability claim) that neither can be gated behind "this looked like
+ * a price objection" — this is the reason the closure is now always
+ * built, never skipped for a cheap early return.
  */
 function buildTurnGuardrail(
   customerMessage: string,
@@ -552,8 +763,21 @@ function buildTurnGuardrail(
     // in a real tool result instead of another guess.
     if (looksLikeFabricatedCheckoutLink(content, facts)) return 'createCheckoutLink';
 
+    // Also unconditional, same tier — a fabricated price, discount
+    // percentage, or availability claim is at least as serious as a
+    // fabricated URL (see the CLAIM GUARD section's own header comment),
+    // so it can't be gated behind "this looked like a price objection"
+    // either. Re-forces getCartDetails: the one tool that re-grounds the
+    // model in real prices, cart value, AND stock/size status all at
+    // once, same corrective lever looksLikeMissingPriceJustification
+    // already uses below.
+    if (looksLikeFabricatedClaim(content, facts)) return 'getCartDetails';
+
     const selectionTool = requiredAlternativeSelectionTool(facts);
     if (selectionTool) return selectionTool;
+
+    const removalTool = requiredCartItemRemovalTool(facts);
+    if (removalTool) return removalTool;
 
     if (priceObjectionRaised) {
       const required = requiredPriceObjectionTool(facts);
@@ -675,6 +899,52 @@ function mentionsOptionByName(text: string, item: { name: string }): boolean {
   const lower = text.toLowerCase();
   const words = item.name.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 3);
   return words.some((w) => lower.includes(w));
+}
+
+/**
+ * Resolves which line of a MULTI-ITEM cart the customer wants dropped from
+ * free text like "I only really want the co-ord set, not the top" — same
+ * word-overlap matching mentionsOptionByName already uses, just applied to
+ * the cart's OWN items instead of a freshly-presented alternatives list,
+ * and split into clauses so negation is judged per-clause, not globally:
+ * "not" appearing anywhere in the message would otherwise flip a mention
+ * that was never actually negated (e.g. misreading "only the co-ord set"
+ * as negated because a LATER clause happens to contain "not").
+ *
+ * Only ever returns an itemId when the text unambiguously points at
+ * exactly one line to remove:
+ *  - a mention inside a clause containing a negation word (NEGATIVE_PATTERN)
+ *    -> remove that item directly ("not the top").
+ *  - exactly one item mentioned anywhere, cart has exactly two items, no
+ *    negation at all -> the UNMENTIONED item is what's being dropped
+ *    ("I'll just take the co-ord set").
+ * Anything murkier (nothing mentioned, both items mentioned with no
+ * negation, 3+ item carts with only one clear mention) returns undefined
+ * and is left to the model — same fallback posture as every other
+ * heuristic in this file.
+ */
+function resolvePartialCartRemoval(items: CartLineItem[], message: string): string | undefined {
+  if (items.length < 2) return undefined;
+  const resolved = items
+    .map((line) => ({ itemId: line.itemId, product: getCatalogItem(line.itemId) }))
+    .filter((x): x is { itemId: string; product: NonNullable<ReturnType<typeof getCatalogItem>> } => Boolean(x.product));
+  if (resolved.length < 2) return undefined;
+
+  const clauses = message.toLowerCase().split(/[,.;]|\bbut\b/);
+  let keep: string | undefined;
+  let remove: string | undefined;
+  for (const clause of clauses) {
+    const negated = NEGATIVE_PATTERN.test(clause);
+    for (const { itemId, product } of resolved) {
+      const mentioned = mentionsOptionByName(clause, product) || clause.includes(product.category.toLowerCase());
+      if (!mentioned) continue;
+      if (negated) remove = remove ?? itemId;
+      else keep = keep ?? itemId;
+    }
+  }
+  if (remove) return remove;
+  if (keep && resolved.length === 2) return resolved.find((r) => r.itemId !== keep)?.itemId;
+  return undefined;
 }
 
 /**
@@ -862,7 +1132,25 @@ const ALTERNATIVE_TOOLS = new Set([
   'findAlternativesByBudget',
   'findAlternativesByColour',
   'getActiveSales',
+  // Trigger 2 (recommendations) — deliberately returns the same `items`
+  // shape as the tools above, so it plugs into pendingOptions/
+  // presented-before-selectable/selectAlternative for free, no new
+  // state-machine code required. See tools.ts's own comment on
+  // getRecommendationsFromHistoryTool.
+  'getRecommendationsFromHistory',
 ]);
+
+/**
+ * Tool calls that mean the turn has moved on to a closing/administrative
+ * action — a discount code, a checkout/reorder link, a final outcome —
+ * rather than presenting a product. Checked in sendMessage's onToolCall
+ * callback: if any of these fire during a turn, no product image is
+ * attached to that turn's reply even if an ALTERNATIVE_TOOLS call also
+ * happened to run earlier in the same turn. Matches the build spec's
+ * WHERE NOT TO USE list verbatim — discount code messages, confirmations,
+ * checkout links are never image messages.
+ */
+const IMAGE_SUPPRESSING_TOOLS = new Set(['createCheckoutLink', 'generateDiscountCode', 'markCartOutcome']);
 
 /** Words too generic to prove a reply actually justified THIS item's price
  * — every kurta/dress/saree in the catalog would trivially "pass" a check
@@ -889,7 +1177,13 @@ function updateFacts(facts: ConversationFacts, name: string, _args: Record<strin
 
   if (ALTERNATIVE_TOOLS.has(name)) {
     const items = (r?.items as { itemId: string; name: string; price: number }[] | undefined) ?? [];
+    // maxBudget echoes the customer's OWN stated number back — see
+    // findAlternativesByBudgetTool — recorded regardless of whether any
+    // items matched, so a reply can still say "nothing under ₹2000" using
+    // the customer's own real figure without tripping the claim guard.
+    recordPrice(facts, (r?.maxBudget as number | undefined) ?? undefined);
     if (r?.success !== false && items.length > 0) {
+      for (const it of items) recordPrice(facts, it.price);
       facts.pendingOptions = {
         tool: name,
         items: items.map((it) => ({ itemId: it.itemId, name: it.name, price: it.price })),
@@ -908,8 +1202,14 @@ function updateFacts(facts: ConversationFacts, name: string, _args: Record<strin
     case 'getCartDetails':
       if (r?.success) {
         facts.cartDetailsChecked = true;
-        const items = (r.items as { name?: string; fabric?: string }[] | undefined) ?? [];
+        const items = (r.items as { name?: string; fabric?: string; price?: number; sizeInStock?: boolean }[] | undefined) ?? [];
         facts.itemJustificationTerms = items.flatMap((it) => extractJustificationTerms(it.name ?? '', it.fabric ?? ''));
+        for (const it of items) {
+          recordPrice(facts, it.price);
+          if (it.sizeInStock === true) facts.cartAnyItemInStock = true;
+          if (it.sizeInStock === false) facts.cartAnyItemOutOfStock = true;
+        }
+        recordPrice(facts, r.cartValue as number | undefined);
       }
       break;
     case 'selectAlternative':
@@ -917,6 +1217,15 @@ function updateFacts(facts: ConversationFacts, name: string, _args: Record<strin
         facts.alternativeSelectionApplied = true;
         facts.selectedAlternativeItemId = r.itemId as string | undefined;
         facts.selectedAlternativeName = r.name as string | undefined;
+        recordPrice(facts, r.price as number | undefined);
+      }
+      break;
+    case 'removeCartItem':
+      if (r?.success) {
+        facts.cartItemRemovalApplied = true;
+        facts.pendingCartItemRemoval = r.removedItemId as string | undefined;
+        facts.pendingCartItemRemovalName = r.removedName as string | undefined;
+        recordPrice(facts, r.newCartValue as number | undefined);
       }
       break;
     case 'checkDiscountEligibility':
@@ -924,6 +1233,8 @@ function updateFacts(facts: ConversationFacts, name: string, _args: Record<strin
         facts.discountEligibilityChecked = true;
         facts.discountEligible = r.eligible as boolean | undefined;
         facts.discountMaxPercent = r.maxDiscountPercent as number | undefined;
+        recordPercent(facts, r.maxDiscountPercent as number | undefined);
+        recordPrice(facts, r.cartValue as number | undefined);
       }
       break;
     case 'generateDiscountCode':
@@ -931,17 +1242,25 @@ function updateFacts(facts: ConversationFacts, name: string, _args: Record<strin
         facts.discountOffered = true;
         facts.discountPercent = r.discountPercent as number | undefined;
         facts.discountCode = r.discountCode as string | undefined;
+        recordPercent(facts, r.discountPercent as number | undefined);
       }
       break;
     case 'createCheckoutLink':
       if (r?.success) {
         facts.checkoutLinkCreated = true;
         facts.checkoutLink = r.checkoutLink as string | undefined;
+        recordPrice(facts, r.finalAmount as number | undefined);
       }
       break;
     case 'markCartOutcome':
       if (r?.success) facts.outcomeSet = r.outcome as CartOutcome | undefined;
       break;
+    case 'getBrowseAbandonment': {
+      facts.browseAbandonmentChecked = true;
+      const items = (r?.items as { price?: number }[] | undefined) ?? [];
+      for (const it of items) recordPrice(facts, it.price);
+      break;
+    }
   }
 }
 
@@ -1003,7 +1322,15 @@ function factsToSummary(f: ConversationFacts): string {
   } else if (f.selectedAlternativeName) {
     parts.push(`customer selected: ${f.selectedAlternativeName} — the cart has already been swapped to this item, do not ask them to choose again`);
   }
+  if (f.pendingCartItemRemoval && !f.cartItemRemovalApplied) {
+    parts.push(
+      `the customer just said they don't want "${f.pendingCartItemRemovalName ?? f.pendingCartItemRemoval}" from this multi-item cart — you MUST call removeCartItem with itemId ${f.pendingCartItemRemoval} before replying; the cart still has the full original items until you do, so any price or checkout link right now would be wrong`,
+    );
+  } else if (f.cartItemRemovalApplied) {
+    parts.push(`already removed from this cart: ${f.pendingCartItemRemovalName ?? f.pendingCartItemRemoval} — the cart now only reflects what the customer actually wants, do not re-ask or re-list what was dropped`);
+  }
   if (f.checkoutLinkCreated) parts.push(`a checkout link was already created (${f.checkoutLink}) — do NOT create another`);
+  if (f.browseAbandonmentChecked) parts.push('browse-abandonment items already fetched this conversation — no need to re-check');
   if (f.outcomeSet) {
     parts.push(`final outcome already recorded as "${f.outcomeSet}" — do NOT call markCartOutcome again for this cart`);
     if (f.outcomeSet === 'opted_out') {
@@ -1056,6 +1383,62 @@ export interface CampaignStats {
    * for a sale it didn't cause. */
   customerInitiatedRecoveredCount: number;
   customerInitiatedRecoveredRevenue: number;
+}
+
+/** Every campaign type, in the order the dashboard's selector shows them —
+ * used both to build statsByType below and by the dashboard's own
+ * CampaignTypeSelector. */
+export const CAMPAIGN_TYPES: CampaignType[] = ['cart_recovery', 'recommendation', 'browse_abandonment'];
+
+/**
+ * Pulled out of the `stats` useMemo below so the exact same KPI math can
+ * run once over the full cart list (the "All campaigns" combined view) and
+ * once per campaignType (the per-trigger dashboard view) — one function,
+ * so the two views can never silently drift into computing a KPI two
+ * different ways. Takes a pre-filtered `carts` slice; every figure it
+ * returns is scoped to exactly the carts it was given.
+ */
+function computeCampaignStats(carts: AbandonedCart[], threads: Record<string, ThreadState>): CampaignStats {
+  const cartsTargeted = carts.length;
+  const messagesSent = cartsTargeted;
+  const repliesReceived = carts.filter((c) => threads[c.cartId]?.messages.some((m) => m.role === 'user')).length;
+  const recovered = carts.filter((c) => c.outcome === 'recovered');
+  const lostCount = carts.filter((c) => c.outcome === 'lost').length;
+  const optedOutCount = carts.filter((c) => c.outcome === 'opted_out').length;
+  const recoveryRate = cartsTargeted === 0 ? 0 : Math.round((recovered.length / cartsTargeted) * 1000) / 10;
+  const revenueRecovered = recovered.reduce((sum, c) => sum + amountPaidForCart(c), 0);
+  const totalCartValue = carts.reduce((sum, c) => sum + resolveCart(c).cartValue, 0);
+  const revenueAtRisk = carts.filter((c) => c.outcome === 'active').reduce((sum, c) => sum + resolveCart(c).cartValue, 0);
+  const linkSent = carts.filter((c) => Boolean(c.checkoutLink) || Boolean(c.customerInitiatedRecovery));
+  const pendingCheckout = carts.filter(
+    (c) => c.outcome === 'checkout_sent' || (c.customerInitiatedRecovery && !c.customerInitiatedRecovery.paid),
+  );
+  const pendingCheckoutValue = pendingCheckout.reduce((sum, c) => sum + amountPaidForCart(c), 0);
+  const discounted = carts.filter((c) => c.discountOffered && c.discountPercent != null);
+  const avgDiscountPercent =
+    discounted.length === 0
+      ? null
+      : Math.round((discounted.reduce((sum, c) => sum + (c.discountPercent ?? 0), 0) / discounted.length) * 10) / 10;
+  const customerInitiated = carts.filter((c) => c.customerInitiatedRecovery?.paid);
+  const customerInitiatedRecoveredCount = customerInitiated.length;
+  const customerInitiatedRecoveredRevenue = customerInitiated.reduce((sum, c) => sum + amountPaidForCart(c), 0);
+  return {
+    cartsTargeted,
+    messagesSent,
+    repliesReceived,
+    linkSentCount: linkSent.length,
+    pendingCheckoutValue,
+    recoveredCount: recovered.length,
+    lostCount,
+    optedOutCount,
+    recoveryRate,
+    revenueRecovered,
+    totalCartValue,
+    revenueAtRisk,
+    avgDiscountPercent,
+    customerInitiatedRecoveredCount,
+    customerInitiatedRecoveredRevenue,
+  };
 }
 
 function isQuotaError(raw: string): boolean {
@@ -1117,6 +1500,9 @@ export function useCartRecoveryAgent() {
    */
   const buildExecutors = useCallback((cartId: string, facts: ConversationFacts): ToolExecutorMap => {
     let working = cartsRef.current;
+    // Resolved once — customerId never changes for a cart, even as
+    // `working` itself gets reassigned below as tools mutate other fields.
+    const customerId = working.find((c) => c.cartId === cartId)?.customerId ?? '';
 
     function applyCartUpdate(updated: AbandonedCart | null) {
       if (!updated) return;
@@ -1200,7 +1586,30 @@ export function useCartRecoveryAgent() {
         applyCartUpdate(res.cart);
         return res.output;
       },
+      removeCartItem: (args) => {
+        // facts.pendingCartItemRemoval, when set, was resolved in CODE from
+        // the customer's own free text (resolvePartialCartRemoval) — same
+        // "a captured selection wins over a hallucinated argument" rule
+        // selectAlternative's executor follows above. Only falls back to
+        // the model's own args.itemId when the text didn't unambiguously
+        // resolve on its own (e.g. it named the item some other way).
+        const itemId = facts.pendingCartItemRemoval || String(args.itemId ?? '');
+        const res = removeCartItemTool(working, String(args.cartId ?? cartId), itemId);
+        applyCartUpdate(res.cart);
+        return res.output;
+      },
       createCheckoutLink: (args) => {
+        // Hard backstop, same reasoning as the selectedAlternativeItemId
+        // check just below: checkout must be physically incapable of
+        // running while a code-resolved partial-cart removal hasn't
+        // actually landed yet — otherwise it prices the FULL original
+        // cart even though the customer only wanted part of it.
+        if (facts.pendingCartItemRemoval && !facts.cartItemRemovalApplied) {
+          return {
+            success: false,
+            error: `The customer said they don't want "${facts.pendingCartItemRemovalName ?? facts.pendingCartItemRemoval}" but the cart has not been updated yet — call removeCartItem first, then createCheckoutLink.`,
+          };
+        }
         // Hard backstop, not just best-effort forcing: even if
         // requiredAlternativeSelectionTool somehow failed to force
         // selectAlternative first (a future regression, a retry budget
@@ -1257,6 +1666,8 @@ export function useCartRecoveryAgent() {
         applyCartUpdate(res.cart);
         return res.output;
       },
+      getRecommendationsFromHistory: (args) => getRecommendationsFromHistoryTool(String(args.customerId ?? customerId)),
+      getBrowseAbandonment: (args) => getBrowseAbandonmentTool(String(args.customerId ?? customerId), working),
     };
   }, [brand.checkoutBaseUrl]);
 
@@ -1327,6 +1738,33 @@ export function useCartRecoveryAgent() {
 
         captureNextReply(facts, trimmed);
 
+        // A customer's own stated budget ("under ₹2000") is a real,
+        // grounded number the moment they say it — recorded here so the
+        // claim guard (looksLikeFabricatedPriceClaim) doesn't flag the
+        // agent simply echoing it back before a tool call has independently
+        // confirmed it (findAlternativesByBudget's own maxBudget field
+        // covers the same case once that tool runs; this covers the
+        // window before it does, e.g. an acknowledgement in the same
+        // reply that also makes the tool call).
+        for (const m of trimmed.matchAll(RUPEE_CLAIM_PATTERN)) {
+          const value = Number(m[1].replace(/,/g, ''));
+          if (Number.isFinite(value)) recordPrice(facts, value);
+        }
+
+        // Same "resolve deterministic customer intent in code before the
+        // LLM ever sees it" posture as captureNextReply above, just for a
+        // multi-item cart's own items instead of a freshly-presented
+        // alternatives list. Skipped once a removal already landed this
+        // conversation — re-resolving against the now-SHRUNK cart could
+        // otherwise misfire on a later, unrelated message.
+        if (cart.items.length >= 2 && !facts.cartItemRemovalApplied) {
+          const resolvedRemoval = resolvePartialCartRemoval(cart.items, trimmed);
+          if (resolvedRemoval) {
+            facts.pendingCartItemRemoval = resolvedRemoval;
+            facts.pendingCartItemRemovalName = getCatalogItem(resolvedRemoval)?.name;
+          }
+        }
+
         setThreads((prev) => ({
           ...prev,
           [cartId]: { ...prev[cartId], isTyping: true, toolActivity: THINKING_LABEL, streamingText: '' },
@@ -1334,6 +1772,13 @@ export function useCartRecoveryAgent() {
 
         try {
           const executors = buildExecutors(cartId, facts);
+          // Per-turn only — a fresh `let` inside this async call, reset
+          // every customer message, so a candidate from turn N can never
+          // leak into turn N+1's reply. See IMAGE_SUPPRESSING_TOOLS' own
+          // doc for why closing-action tools force this back to empty
+          // even if a product-presenting tool ran earlier the same turn.
+          let candidateImages: { image: ProductImage; number?: number }[] = [];
+          let suppressImages = false;
           const reply = await sendAgentMessage(
             session,
             trimmed,
@@ -1345,6 +1790,37 @@ export function useCartRecoveryAgent() {
               }));
               console.log(`[useCartRecoveryAgent] tool call (${cartId}): ${name}`, args, '->', result);
               updateFacts(facts, name, args, result);
+
+              // Product-image attachment — deliberately keyed off the REAL
+              // tool result's own itemIds (via productImageFor), never off
+              // anything the model's reply text says, so an image can never
+              // show a product that wasn't genuinely just returned by a
+              // tool this turn. Last successful product-presenting tool
+              // call this turn wins, same "most recent overwrites" rule
+              // updateFacts already uses for facts.pendingOptions.
+              if (IMAGE_SUPPRESSING_TOOLS.has(name)) {
+                suppressImages = true;
+              } else if (ALTERNATIVE_TOOLS.has(name)) {
+                const r = result as { success?: boolean; items?: { itemId: string }[] } | undefined;
+                if (r && r.success !== false && r.items && r.items.length > 0) {
+                  const items = r.items;
+                  const multi = items.length > 1;
+                  const built: { image: ProductImage; number?: number }[] = [];
+                  items.forEach((it, i) => {
+                    const image = productImageFor(it.itemId);
+                    if (image) built.push({ image, number: multi ? i + 1 : undefined });
+                  });
+                  candidateImages = built;
+                }
+              } else if (name === 'getBrowseAbandonment') {
+                const r = result as { success?: boolean; items?: { itemId: string }[] } | undefined;
+                if (r && r.success !== false && r.items && r.items.length > 0) {
+                  candidateImages = r.items
+                    .map((it) => productImageFor(it.itemId))
+                    .filter((image): image is ProductImage => Boolean(image))
+                    .map((image) => ({ image }));
+                }
+              }
             },
             (textSoFar) =>
               setThreads((prev) => ({ ...prev, [cartId]: { ...prev[cartId], streamingText: textSoFar } })),
@@ -1356,11 +1832,32 @@ export function useCartRecoveryAgent() {
           // markPendingOptionsPresented's own comment for why this can't
           // happen any earlier (e.g. inside the tool-call callback above).
           markPendingOptionsPresented(facts, reply);
+
+          // Only attach an image whose product the reply actually named —
+          // same "the customer has to have genuinely been told" standard
+          // markPendingOptionsPresented already holds pendingOptions to.
+          // Guards against a guardrail-forced retry leaving a stale
+          // candidate that the FINAL reply never ended up talking about.
+          const lowerReply = reply.toLowerCase();
+          const imagesToAttach = suppressImages
+            ? []
+            : candidateImages.filter(({ image }) => lowerReply.includes(image.name.toLowerCase()));
+
+          const now = Date.now();
+          const newMessages: ChatMessage[] = imagesToAttach.map(({ image, number }, i) => ({
+            id: uid(),
+            role: 'agent',
+            text: productImageCaption(image, number),
+            timestamp: now + i,
+            image,
+          }));
+          newMessages.push({ id: uid(), role: 'agent', text: reply, timestamp: now + imagesToAttach.length });
+
           setThreads((prev) => ({
             ...prev,
             [cartId]: {
               ...prev[cartId],
-              messages: [...prev[cartId].messages, { id: uid(), role: 'agent', text: reply, timestamp: Date.now() }],
+              messages: [...prev[cartId].messages, ...newMessages],
             },
           }));
         } catch (err) {
@@ -1404,70 +1901,30 @@ export function useCartRecoveryAgent() {
     [sendMessage],
   );
 
-  const stats: CampaignStats = useMemo(() => {
-    const cartsTargeted = carts.length;
-    // The opening message already went out to every cart as part of the
-    // campaign — only replies happen live during the demo.
-    const messagesSent = cartsTargeted;
-    const repliesReceived = Object.values(threads).filter((t) => t.messages.some((m) => m.role === 'user')).length;
-    // 'recovered' is ONLY ever reached via the dashboard's "Mark as paid"
-    // control (markCartPaidTool) — the LLM cannot set it (see
-    // LlmSettableOutcome) — so filtering on it here is already
-    // "confirmed paid only" by construction, not something this
-    // computation has to separately enforce.
-    const recovered = carts.filter((c) => c.outcome === 'recovered');
-    const lostCount = carts.filter((c) => c.outcome === 'lost').length;
-    const optedOutCount = carts.filter((c) => c.outcome === 'opted_out').length;
-    const recoveryRate = cartsTargeted === 0 ? 0 : Math.round((recovered.length / cartsTargeted) * 1000) / 10;
-    // Always derived from THIS cart's CURRENT items via amountPaidForCart —
-    // never a stored total — so a swap (selectAlternativeTool) that happens
-    // to change a cart's items after this render would still show correctly
-    // on the very next one. See AbandonedCart.checkoutDiscountApplied.
-    const revenueRecovered = recovered.reduce((sum, c) => sum + amountPaidForCart(c), 0);
-    const totalCartValue = carts.reduce((sum, c) => sum + resolveCart(c).cartValue, 0);
-    const revenueAtRisk = carts
-      .filter((c) => c.outcome === 'active')
-      .reduce((sum, c) => sum + resolveCart(c).cartValue, 0);
-    // checkoutLink persists forward once 'recovered' too, so this counts
-    // every cart that EVER had a link created — the funnel's "link sent"
-    // stage is cumulative, same as every earlier stage.
-    const linkSent = carts.filter((c) => Boolean(c.checkoutLink) || Boolean(c.customerInitiatedRecovery));
-    // Pending specifically — NOT yet confirmed paid. A 'recovered' cart
-    // (or a paid customerInitiatedRecovery) has already graduated into
-    // revenueRecovered above, so it's excluded here to avoid double
-    // counting the same rupee in two KPIs at once.
-    const pendingCheckout = carts.filter(
-      (c) => c.outcome === 'checkout_sent' || (c.customerInitiatedRecovery && !c.customerInitiatedRecovery.paid),
-    );
-    const pendingCheckoutValue = pendingCheckout.reduce((sum, c) => sum + amountPaidForCart(c), 0);
-    const discounted = carts.filter((c) => c.discountOffered && c.discountPercent != null);
-    const avgDiscountPercent =
-      discounted.length === 0
-        ? null
-        : Math.round((discounted.reduce((sum, c) => sum + (c.discountPercent ?? 0), 0) / discounted.length) * 10) /
-          10;
-    // .paid required — see customerInitiatedRecovery's own doc. An
-    // unpaid one is already counted in pendingCheckoutValue above instead.
-    const customerInitiated = carts.filter((c) => c.customerInitiatedRecovery?.paid);
-    const customerInitiatedRecoveredCount = customerInitiated.length;
-    const customerInitiatedRecoveredRevenue = customerInitiated.reduce((sum, c) => sum + amountPaidForCart(c), 0);
-    return {
-      cartsTargeted,
-      messagesSent,
-      repliesReceived,
-      linkSentCount: linkSent.length,
-      pendingCheckoutValue,
-      recoveredCount: recovered.length,
-      lostCount,
-      optedOutCount,
-      recoveryRate,
-      revenueRecovered,
-      totalCartValue,
-      revenueAtRisk,
-      avgDiscountPercent,
-      customerInitiatedRecoveredCount,
-      customerInitiatedRecoveredRevenue,
-    };
+  // 'recovered' is ONLY ever reached via the dashboard's "Mark as paid"
+  // control (markCartPaidTool) — the LLM cannot set it (see
+  // LlmSettableOutcome) — so every recoveredCount/revenueRecovered figure
+  // below is already "confirmed paid only" by construction. checkoutLink
+  // persists forward once 'recovered' too, so linkSentCount counts every
+  // cart that EVER had a link created — the funnel's "link sent" stage is
+  // cumulative, same as every earlier stage. Revenue is always derived
+  // fresh from each cart's CURRENT items via amountPaidForCart, never a
+  // stored total — see AbandonedCart.checkoutDiscountApplied.
+  const stats: CampaignStats = useMemo(() => computeCampaignStats(carts, threads), [carts, threads]);
+
+  /** The same KPIs, scoped to one campaign type at a time — what the
+   * dashboard's campaign-type selector and "revenue by campaign type"
+   * combined view actually read. Every figure here is a live re-derivation
+   * from `carts`/`threads`, same as `stats` above, just pre-filtered. */
+  const statsByType: Record<CampaignType, CampaignStats> = useMemo(() => {
+    const out = {} as Record<CampaignType, CampaignStats>;
+    for (const type of CAMPAIGN_TYPES) {
+      out[type] = computeCampaignStats(
+        carts.filter((c) => c.campaignType === type),
+        threads,
+      );
+    }
+    return out;
   }, [carts, threads]);
 
   const reset = useCallback(() => {
@@ -1515,6 +1972,7 @@ export function useCartRecoveryAgent() {
     apiKeyMissing,
     carts,
     stats,
+    statsByType,
     activeCartId,
     setActiveCartId,
     activeThread: {

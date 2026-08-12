@@ -14,6 +14,7 @@ function App() {
     apiKeyMissing,
     carts,
     stats,
+    statsByType,
     activeCartId,
     setActiveCartId,
     activeThread,
@@ -35,12 +36,12 @@ function App() {
 
   return (
     <div className="flex h-screen min-h-0 flex-col bg-[#f6f7f8]">
-      {showIntro && <IntroOverlay accent={brand.colors.primary} onDismiss={() => setShowIntro(false)} />}
+      {showIntro && <IntroOverlay accent={brand.colors.accentDark} onDismiss={() => setShowIntro(false)} />}
 
       <TopBar brand={brand} onReset={reset} />
 
       <SplitView
-        accent={brand.colors.primary}
+        accent={brand.colors.accentDark}
         left={
           apiKeyMissing ? (
             <ApiKeyNotice />
@@ -64,6 +65,7 @@ function App() {
             brand={brand}
             carts={carts}
             stats={stats}
+            statsByType={statsByType}
             toolActivity={activeThread.toolActivity}
             activeCartId={activeCartId}
             onSelectCart={setActiveCartId}

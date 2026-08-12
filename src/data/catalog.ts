@@ -1,7 +1,30 @@
 import type { CatalogItem } from '../types';
 
-function img(label: string, bg = 'EDE7DA', fg = '4A4438'): string {
-  return `https://placehold.co/320x400/${bg}/${fg}?text=${encodeURIComponent(label)}`;
+/**
+ * Local product photography — see public/products/README.md for the full
+ * file manifest this generates against. Two naming patterns:
+ *  - `/products/{itemId}.jpg` — the base image, every catalog item's own
+ *    (and, today, only) photo.
+ *  - `/products/{itemId}-{colour}.jpg` — reserved for a genuine
+ *    colour-variant photo. No current Kora catalog item actually needs
+ *    one: every entry below has exactly one fixed `colour` (see
+ *    CatalogItem's own doc — "no true SKU colour-variants modeled"; a
+ *    different colour is always a DIFFERENT catalog item with its own base
+ *    image, e.g. K-KUR-01 vs K-KUR-02, never two photos of the same
+ *    entry). The second parameter exists so a future item that genuinely
+ *    does carry multiple colour options doesn't need a second image-URL
+ *    scheme bolted on later — nothing in this file calls it yet.
+ *
+ * Swapped from Picsum's random per-seed stock photos: those were real
+ * photographs but never actually Kora's own products. Local files (even
+ * placeholder ones to start) let this be genuine product photography
+ * instead — see ChatBubble.tsx, which now omits a message's image
+ * entirely if the file 404s, rather than ever falling back to a random
+ * photo of something else.
+ */
+function img(itemId: string, colour?: string): string {
+  const suffix = colour ? `-${colour.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}` : '';
+  return `/products/${itemId}${suffix}.jpg`;
 }
 
 const APPAREL_SIZES = ['S', 'M', 'L', 'XL'];
@@ -32,7 +55,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 52,
     inStock: true,
-    imageUrl: img('Cotton Kurta'),
+    imageUrl: img('K-KUR-01'),
     colour: 'Undyed Natural',
     sizes: APPAREL_SIZES,
     // L sold out (still fine in S/M/XL) — backs CART-014's size-unavailable
@@ -48,7 +71,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 50,
     inStock: true,
-    imageUrl: img('Linen Kurta', 'DDE2D0', '3F4A36'),
+    imageUrl: img('K-KUR-02'),
     colour: 'Sage',
     sizes: APPAREL_SIZES,
     outOfStockSizes: [],
@@ -62,7 +85,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 48,
     inStock: true,
-    imageUrl: img('Block Print Kurta', 'D9B99B', '4A3423'),
+    imageUrl: img('K-KUR-03'),
     colour: 'Clay',
     sizes: APPAREL_SIZES,
     outOfStockSizes: [],
@@ -76,7 +99,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 45,
     inStock: true,
-    imageUrl: img('Handloom Saree', 'D9B99B', '4A3423'),
+    imageUrl: img('K-SAR-01'),
     colour: 'Clay Border',
     sizes: FREE_SIZE,
     outOfStockSizes: [],
@@ -90,7 +113,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 42,
     inStock: true,
-    imageUrl: img('Tussar Saree', 'DDE2D0', '3F4A36'),
+    imageUrl: img('K-SAR-02'),
     colour: 'Sage',
     sizes: FREE_SIZE,
     outOfStockSizes: [],
@@ -104,7 +127,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 47,
     inStock: true,
-    imageUrl: img('Co-ord Set'),
+    imageUrl: img('K-CO-01'),
     colour: 'Undyed Natural',
     sizes: ['S', 'M', 'L'],
     outOfStockSizes: [],
@@ -118,7 +141,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 46,
     inStock: false,
-    imageUrl: img('Linen Co-ord', 'DDE2D0', '3F4A36'),
+    imageUrl: img('K-CO-02'),
     colour: 'Sage',
     sizes: ['S', 'M', 'L'],
     // Discontinued outright — every size out, matching inStock:false above.
@@ -133,7 +156,7 @@ export const catalog: CatalogItem[] = [
     onSale: true,
     marginPercent: 44,
     inStock: true,
-    imageUrl: img('Midi Dress', 'D9B99B', '4A3423'),
+    imageUrl: img('K-DRS-01'),
     colour: 'Clay',
     sizes: APPAREL_SIZES,
     outOfStockSizes: [],
@@ -147,7 +170,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 48,
     inStock: true,
-    imageUrl: img('Maxi Dress'),
+    imageUrl: img('K-DRS-02'),
     colour: 'Undyed Natural',
     sizes: APPAREL_SIZES,
     outOfStockSizes: [],
@@ -161,7 +184,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 50,
     inStock: true,
-    imageUrl: img('Wrap Top', 'DDE2D0', '3F4A36'),
+    imageUrl: img('K-TOP-01'),
     colour: 'Sage',
     sizes: ['S', 'M', 'L'],
     outOfStockSizes: [],
@@ -175,7 +198,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 38,
     inStock: true,
-    imageUrl: img('Boxy Top'),
+    imageUrl: img('K-TOP-02'),
     colour: 'Undyed Natural',
     sizes: APPAREL_SIZES,
     outOfStockSizes: [],
@@ -189,7 +212,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 49,
     inStock: true,
-    imageUrl: img('Wide Leg Trousers'),
+    imageUrl: img('K-TRS-01'),
     colour: 'Undyed Natural',
     sizes: TROUSER_SIZES,
     outOfStockSizes: [],
@@ -203,7 +226,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 47,
     inStock: true,
-    imageUrl: img('Linen Trousers', 'DDE2D0', '3F4A36'),
+    imageUrl: img('K-TRS-02'),
     colour: 'Sage',
     sizes: TROUSER_SIZES,
     outOfStockSizes: [],
@@ -217,7 +240,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 55,
     inStock: true,
-    imageUrl: img('Silk Occasion Set', 'D9B99B', '4A3423'),
+    imageUrl: img('K-SET-01'),
     colour: 'Ivory',
     sizes: APPAREL_SIZES,
     outOfStockSizes: [],
@@ -236,7 +259,7 @@ export const catalog: CatalogItem[] = [
     // scenario in data/scenarios.ts).
     marginPercent: 20,
     inStock: true,
-    imageUrl: img('Embroidered Dress', 'D9B99B', '4A3423'),
+    imageUrl: img('K-DRS-03'),
     colour: 'Ivory',
     sizes: ['S', 'M', 'L'],
     outOfStockSizes: [],
@@ -250,7 +273,7 @@ export const catalog: CatalogItem[] = [
     onSale: false,
     marginPercent: 40,
     inStock: true,
-    imageUrl: img('Cotton Shawl', 'D9B99B', '4A3423'),
+    imageUrl: img('K-SHW-01'),
     colour: 'Clay',
     sizes: FREE_SIZE,
     outOfStockSizes: [],

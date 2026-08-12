@@ -1,4 +1,5 @@
-import type { ChatMessage } from '../types';
+import { useState } from 'react';
+import type { ChatMessage, ProductImage } from '../types';
 import { parseWhatsAppText } from '../lib/formatText';
 
 function formatTime(ts: number): string {
@@ -39,6 +40,46 @@ function ReadTicks() {
   );
 }
 
+/**
+ * Product photos are local files (see public/products/README.md) that may
+ * genuinely not exist yet — this is prep work ahead of real photography.
+ * On a load failure, this hides itself entirely (`display: none` via early
+ * return, not a broken-image icon or any fallback image) — the build spec
+ * is explicit that a missing file must omit the image, never substitute a
+ * random/wrong one. The caption text below it (in ChatBubble) still
+ * renders normally either way, so the message degrades to plain text, not
+ * a broken layout.
+ */
+function ChatProductImage({ image }: { image: ProductImage }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return null;
+  return (
+    <img
+      src={image.imageUrl}
+      alt={image.name}
+      data-testid="chat-product-image"
+      // Fixed height, not h-auto off the image's natural size — a real
+      // WhatsApp media message is compact regardless of the source
+      // photo's own aspect ratio. object-cover crops rather than
+      // distorting; width still matches the bubble exactly.
+      className="block h-60 w-full object-cover"
+      loading="lazy"
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
+/**
+ * A real WhatsApp media message renders as ONE bubble: the image bleeds
+ * edge-to-edge to the bubble's own rounded corners (no padding around it),
+ * caption text sits below it WITH the normal bubble padding, same
+ * timestamp/tick row as any other bubble. The tail triangle has to stay a
+ * SIBLING of the image-clipping wrapper, not a child of it — it's
+ * positioned via a negative offset (-left-1.5/-right-1.5), and an
+ * `overflow-hidden` wrapper (needed to clip the image's corners) would
+ * clip that negative-offset tail right off the bubble too if the tail were
+ * inside it.
+ */
 export function ChatBubble({ message }: { message: ChatMessage }) {
   const isCustomer = message.role === 'user';
 
@@ -47,12 +88,7 @@ export function ChatBubble({ message }: { message: ChatMessage }) {
       data-role={message.role}
       className={`wa-bubble-in flex ${isCustomer ? 'justify-end' : 'justify-start'} px-2.5`}
     >
-      <div
-        className={[
-          'relative max-w-[65%] rounded-lg px-2 py-1.25 text-[14px] leading-[1.3] shadow-sm',
-          isCustomer ? 'bg-[#d9fdd3] text-[#111b21] rounded-tr-none' : 'bg-white text-[#111b21] rounded-tl-none',
-        ].join(' ')}
-      >
+      <div className={`relative max-w-[65%] rounded-lg shadow-sm ${isCustomer ? 'rounded-tr-none' : 'rounded-tl-none'}`}>
         <span
           aria-hidden
           className={[
@@ -62,13 +98,23 @@ export function ChatBubble({ message }: { message: ChatMessage }) {
               : '-left-1.5 bg-white [clip-path:polygon(100%_0,0_0,100%_100%)]',
           ].join(' ')}
         />
-        <p className="whitespace-pre-wrap wrap-break-word">
-          <FormattedText text={message.text} />
-        </p>
-        <span className="mt-0.5 flex items-center justify-end gap-1 text-[10.5px] text-[#667781] select-none">
-          {formatTime(message.timestamp)}
-          {isCustomer && <ReadTicks />}
-        </span>
+        <div
+          className={[
+            'overflow-hidden rounded-lg text-[14px] leading-[1.3] text-[#111b21]',
+            isCustomer ? 'rounded-tr-none bg-[#d9fdd3]' : 'rounded-tl-none bg-white',
+          ].join(' ')}
+        >
+          {message.image && <ChatProductImage image={message.image} />}
+          <div className="px-2 py-1.25">
+            <p className="whitespace-pre-wrap wrap-break-word">
+              <FormattedText text={message.text} />
+            </p>
+            <span className="mt-0.5 flex items-center justify-end gap-1 text-[10.5px] text-[#667781] select-none">
+              {formatTime(message.timestamp)}
+              {isCustomer && <ReadTicks />}
+            </span>
+          </div>
+        </div>
       </div>
     </div>
   );
