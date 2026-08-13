@@ -106,9 +106,27 @@ export function ChatBubble({ message }: { message: ChatMessage }) {
         >
           {message.image && <ChatProductImage image={message.image} />}
           <div className="px-2 py-1.25">
-            <p className="whitespace-pre-wrap wrap-break-word">
-              <FormattedText text={message.text} />
-            </p>
+            {message.text && (
+              <p className="whitespace-pre-wrap wrap-break-word">
+                <FormattedText text={message.text} />
+              </p>
+            )}
+            {/* A real, code-computed link to this product's own page — see
+                types.ts's ProductImage.productUrl doc. Rendered as its own
+                structured element, never mixed into `message.text`, so it
+                can never be something the model paraphrases or drops —
+                every product image carries one, unconditionally. */}
+            {message.image && (
+              <a
+                href={message.image.productUrl}
+                target="_blank"
+                rel="noreferrer"
+                data-testid="chat-product-link"
+                className={`block text-[11.5px] font-medium text-[#0a84c9] underline ${message.text ? 'mt-1' : ''}`}
+              >
+                View product →
+              </a>
+            )}
             <span className="mt-0.5 flex items-center justify-end gap-1 text-[10.5px] text-[#667781] select-none">
               {formatTime(message.timestamp)}
               {isCustomer && <ReadTicks />}

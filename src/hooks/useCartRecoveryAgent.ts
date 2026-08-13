@@ -81,14 +81,14 @@ interface ThreadState {
   streamingText: string;
 }
 
-function buildInitialThreads(catalog: AbandonedCart[]): Record<string, ThreadState> {
+function buildInitialThreads(catalog: AbandonedCart[], productBaseUrl: string): Record<string, ThreadState> {
   const out: Record<string, ThreadState> = {};
   for (const cart of catalog) {
     // The opening message is authored copy that already names this cart's
     // own item (see data/carts.ts) — attaching its real catalog image here
     // is the one place an image is set outside a live tool call, and it's
     // still built the same way (productImageFor, never invented).
-    const openingImage = cart.items[0] ? productImageFor(cart.items[0].itemId) : undefined;
+    const openingImage = cart.items[0] ? productImageFor(cart.items[0].itemId, productBaseUrl) : undefined;
     out[cart.cartId] = {
       messages: [
         { id: uid(), role: 'agent', text: cart.openingMessage, timestamp: cart.abandonedAt + 1000, image: openingImage },
@@ -632,19 +632,27 @@ function looksLikeFabricatedAvailabilityClaim(content: string, facts: Conversati
 }
 
 /**
- * Combines the three claim checks above — the single entry point
- * buildTurnGuardrail actually calls. Kept as one function so the guardrail
- * closure only needs one unconditional check (matching
- * looksLikeFabricatedCheckoutLink's own placement), while each underlying
- * heuristic stays independently named, documented, and (found-live)
- * traceable to the specific failure it exists to catch.
+ * Combines the three claim checks above into the ONE corrective tool
+ * buildTurnGuardrail should force — the single entry point it actually
+ * calls. Deliberately NOT a flat boolean re-forcing getCartDetails for
+ * every kind of fabrication: found live, forcing getCartDetails to correct
+ * a fabricated DISCOUNT PERCENTAGE does nothing useful (getCartDetails
+ * doesn't return eligibility/percent data at all), which wastes one of the
+ * two guardrail retries on a tool call that can't possibly fix the actual
+ * problem — on a weak enough model, that alone was enough to exhaust the
+ * retry budget and fall through to the generic "having trouble" apology
+ * instead of a corrected answer. A fabricated discount percentage is
+ * re-grounded by re-forcing checkDiscountEligibility (the one tool that
+ * actually returns the real percentage); a fabricated price or
+ * stock/availability claim is re-grounded by getCartDetails, same as
+ * before. Checked in this order deliberately: a reply can misstate BOTH a
+ * price and a percentage in the same turn, and the percentage is the
+ * rarer, more specific mistake worth prioritizing the correction for.
  */
-function looksLikeFabricatedClaim(content: string, facts: ConversationFacts): boolean {
-  return (
-    looksLikeFabricatedPriceClaim(content, facts) ||
-    looksLikeFabricatedDiscountClaim(content, facts) ||
-    looksLikeFabricatedAvailabilityClaim(content, facts)
-  );
+function requiredClaimCorrectionTool(content: string, facts: ConversationFacts): string | undefined {
+  if (looksLikeFabricatedDiscountClaim(content, facts)) return 'checkDiscountEligibility';
+  if (looksLikeFabricatedPriceClaim(content, facts) || looksLikeFabricatedAvailabilityClaim(content, facts)) return 'getCartDetails';
+  return undefined;
 }
 
 /**
@@ -767,11 +775,11 @@ function buildTurnGuardrail(
     // percentage, or availability claim is at least as serious as a
     // fabricated URL (see the CLAIM GUARD section's own header comment),
     // so it can't be gated behind "this looked like a price objection"
-    // either. Re-forces getCartDetails: the one tool that re-grounds the
-    // model in real prices, cart value, AND stock/size status all at
-    // once, same corrective lever looksLikeMissingPriceJustification
-    // already uses below.
-    if (looksLikeFabricatedClaim(content, facts)) return 'getCartDetails';
+    // either. See requiredClaimCorrectionTool's own doc for why the
+    // corrective tool depends on WHICH claim was fabricated, rather than
+    // always re-forcing getCartDetails.
+    const claimCorrection = requiredClaimCorrectionTool(content, facts);
+    if (claimCorrection) return claimCorrection;
 
     const selectionTool = requiredAlternativeSelectionTool(facts);
     if (selectionTool) return selectionTool;
@@ -899,6 +907,48 @@ function mentionsOptionByName(text: string, item: { name: string }): boolean {
   const lower = text.toLowerCase();
   const words = item.name.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 3);
   return words.some((w) => lower.includes(w));
+}
+
+/**
+ * Lowercases AND folds every Unicode hyphen/dash lookalike (non-breaking
+ * hyphen, figure dash, en/em dash, minus sign) to a plain ASCII "-" —
+ * found live: a reply correctly named "Sage Linen A-Line Kurta" but with a
+ * non-breaking hyphen (U+2011) in place of the catalog's plain one, which
+ * silently failed a straight `.includes()` substring check against the
+ * real catalog name. Models routinely "prettify" a hyphen this way when
+ * generating text; a substring match against a catalog name has to survive
+ * that or it under-counts which items were genuinely shown — see
+ * imagesToAttach (a per-item image without this could simply never
+ * appear) and markPendingOptionsPresented (same risk, one level up).
+ */
+function normalizeForMatch(s: string): string {
+  // ‐-― covers hyphen, non-breaking hyphen, figure dash, en
+  // dash, em dash, and horizontal bar; − is the Unicode minus sign.
+  return s.toLowerCase().replace(/[‐-―−]/g, '-');
+}
+
+/**
+ * True when EVERY distinctive word (len > 3, hyphens kept as part of a
+ * word) of `itemName` appears somewhere in `text` — not a single contiguous
+ * substring match. Found live, back to back: a reply named an item with a
+ * different Unicode hyphen than the catalog's own (normalizeForMatch's own
+ * bug), and separately a reply inserted an extra word mid-name ("Undyed
+ * NATURAL Cotton Straight Kurta" for the catalog's "Undyed Cotton Straight
+ * Kurta") — both are genuine, complete descriptions of the real item, but
+ * neither survives a strict `.includes(fullName)` check. Requiring every
+ * distinctive WORD (not the whole phrase, and not just one word the way
+ * mentionsOptionByName's lighter `.some()` bar works for a short customer
+ * reply) keeps this resistant to word-order/insertion noise while still
+ * demanding real evidence the item was actually, fully described — not
+ * just alluded to by one word in passing.
+ */
+function repliesGenuinelyDescribe(text: string, itemName: string): boolean {
+  const words = normalizeForMatch(itemName)
+    .split(/[^a-z0-9-]+/)
+    .filter((w) => w.length > 3);
+  if (words.length === 0) return false;
+  const lowerText = normalizeForMatch(text);
+  return words.every((w) => lowerText.includes(w));
 }
 
 /**
@@ -1280,8 +1330,7 @@ function updateFacts(facts: ConversationFacts, name: string, _args: Record<strin
  */
 function markPendingOptionsPresented(facts: ConversationFacts, replyText: string): void {
   if (!facts.pendingOptions || facts.pendingOptions.presented) return;
-  const lower = replyText.toLowerCase();
-  const shown = facts.pendingOptions.items.some((it) => lower.includes(it.name.toLowerCase()));
+  const shown = facts.pendingOptions.items.some((it) => repliesGenuinelyDescribe(replyText, it.name));
   if (shown) {
     facts.pendingOptions.presented = true;
     facts.anyAlternativePresented = true;
@@ -1456,7 +1505,9 @@ export function useCartRecoveryAgent() {
     cartsRef.current = carts;
   }, [carts]);
 
-  const [threads, setThreads] = useState<Record<string, ThreadState>>(() => buildInitialThreads(brand.catalog));
+  const [threads, setThreads] = useState<Record<string, ThreadState>>(() =>
+    buildInitialThreads(brand.catalog, brand.productBaseUrl),
+  );
 
   const sessionsRef = useRef<Record<string, ChatSession>>(buildInitialSessions(brand, brand.catalog));
 
@@ -1807,7 +1858,7 @@ export function useCartRecoveryAgent() {
                   const multi = items.length > 1;
                   const built: { image: ProductImage; number?: number }[] = [];
                   items.forEach((it, i) => {
-                    const image = productImageFor(it.itemId);
+                    const image = productImageFor(it.itemId, brand.productBaseUrl);
                     if (image) built.push({ image, number: multi ? i + 1 : undefined });
                   });
                   candidateImages = built;
@@ -1816,7 +1867,7 @@ export function useCartRecoveryAgent() {
                 const r = result as { success?: boolean; items?: { itemId: string }[] } | undefined;
                 if (r && r.success !== false && r.items && r.items.length > 0) {
                   candidateImages = r.items
-                    .map((it) => productImageFor(it.itemId))
+                    .map((it) => productImageFor(it.itemId, brand.productBaseUrl))
                     .filter((image): image is ProductImage => Boolean(image))
                     .map((image) => ({ image }));
                 }
@@ -1838,16 +1889,15 @@ export function useCartRecoveryAgent() {
           // markPendingOptionsPresented already holds pendingOptions to.
           // Guards against a guardrail-forced retry leaving a stale
           // candidate that the FINAL reply never ended up talking about.
-          const lowerReply = reply.toLowerCase();
           const imagesToAttach = suppressImages
             ? []
-            : candidateImages.filter(({ image }) => lowerReply.includes(image.name.toLowerCase()));
+            : candidateImages.filter(({ image }) => repliesGenuinelyDescribe(reply, image.name));
 
           const now = Date.now();
           const newMessages: ChatMessage[] = imagesToAttach.map(({ image, number }, i) => ({
             id: uid(),
             role: 'agent',
-            text: productImageCaption(image, number),
+            text: productImageCaption(number),
             timestamp: now + i,
             image,
           }));
@@ -1885,7 +1935,7 @@ export function useCartRecoveryAgent() {
         sendingCartIdsRef.current.delete(cartId);
       }
     },
-    [apiKeyMissing, buildExecutors],
+    [apiKeyMissing, buildExecutors, brand.productBaseUrl],
   );
 
   /** Runs a scripted scenario's customer lines one at a time, each awaiting
@@ -1929,7 +1979,7 @@ export function useCartRecoveryAgent() {
 
   const reset = useCallback(() => {
     setCarts(brand.catalog);
-    const initThreads = buildInitialThreads(brand.catalog);
+    const initThreads = buildInitialThreads(brand.catalog, brand.productBaseUrl);
     setThreads(initThreads);
     sessionsRef.current = buildInitialSessions(brand, brand.catalog);
     factsRef.current = Object.fromEntries(brand.catalog.map((c) => [c.cartId, {} as ConversationFacts]));

@@ -155,6 +155,15 @@ export interface BrandConfig {
    * something authoritative to check against.
    */
   checkoutBaseUrl: string;
+  /**
+   * The ONLY source of a product link's domain/path — lib/productImages.ts's
+   * productImageFor builds every real product link from this, same reasoning
+   * as checkoutBaseUrl just above: one authoritative place for what a real
+   * link looks like, so a product image is never shown without a genuine,
+   * code-computed page link attached, and never a link the model itself
+   * could invent (see types.ts's ProductImage.productUrl doc).
+   */
+  productBaseUrl: string;
   catalog: AbandonedCart[];
 }
 
@@ -180,6 +189,7 @@ export const koraBrand: BrandConfig = {
   supportPhone: '+91 98200 44560',
   supportHours: 'Mon–Sat, 10am–7pm IST',
   checkoutBaseUrl: 'https://kora.in/checkout',
+  productBaseUrl: 'https://kora.in/products',
   catalog: carts,
 };
 

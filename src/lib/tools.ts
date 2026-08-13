@@ -228,6 +228,15 @@ export interface FindSimilarItemsOutput {
 export function findSimilarItemsTool(itemId: string, maxPrice: number): FindSimilarItemsOutput {
   const source = getCatalogItem(itemId);
   if (!source) return { success: false, error: 'Item not found in catalog.' };
+  // Without this, a missing/invalid maxPrice defaults to 0 via the
+  // executor's Number(args.maxPrice ?? 0), which silently returns a
+  // "successful" EMPTY items array (nothing is ever <= 0) — indistinguishable
+  // from "no cheaper alternative exists," when the real problem was an
+  // argument that was never actually given. Same standard
+  // findAlternativesByBudgetTool already holds itself to.
+  if (!Number.isFinite(maxPrice) || maxPrice <= 0) {
+    return { success: false, error: 'A valid maximum price is required.' };
+  }
 
   const matches = catalog
     .filter((p) => p.itemId !== itemId && p.category === source.category && p.inStock && p.price <= maxPrice)
@@ -356,6 +365,12 @@ export function findAlternativesByColourTool(itemId: string, excludeColour: stri
   const source = getCatalogItem(itemId);
   if (!source) return { success: false, error: 'Item not found in catalog.' };
   const excluded = excludeColour.trim().toLowerCase();
+  // Without this, a missing/empty excludeColour silently matches "every
+  // colour" (nothing ever equals an empty string), returning every in-stock
+  // item in the category as if it were a real colour-based result — same
+  // class of gap findAlternativesBySizeTool already guards against for an
+  // empty size.
+  if (!excluded) return { success: false, error: 'No colour given.' };
 
   const matches = catalog
     .filter((p) => p.itemId !== itemId && p.category === source.category && p.inStock && p.colour.toLowerCase() !== excluded)

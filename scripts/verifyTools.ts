@@ -19,6 +19,7 @@ import {
   findAlternativesByBudgetTool,
   findAlternativesByColourTool,
   findAlternativesBySizeTool,
+  findSimilarItemsTool,
   generateDiscountCodeTool,
   getActiveSalesTool,
   getCartDetailsTool,
@@ -338,6 +339,26 @@ console.log('\nremoveCartItem — refuses once a checkout link already exists');
   list = list.map((c) => (c.cartId === 'CART-002' ? (link.cart as (typeof list)[number]) : c));
   const res = removeCartItemTool(list, 'CART-002', 'K-TOP-01');
   assert(res.output.success === false, 'refused — items can no longer change after checkout');
+}
+
+console.log('\nfindSimilarItems — refuses a missing/invalid maxPrice instead of silently returning an empty list');
+{
+  const zero = findSimilarItemsTool('K-KUR-01', 0);
+  assert(zero.success === false, 'maxPrice 0 (the executor default for a missing argument) is refused, not treated as a real budget');
+  const negative = findSimilarItemsTool('K-KUR-01', -500);
+  assert(negative.success === false, 'a negative maxPrice is refused');
+  const valid = findSimilarItemsTool('K-KUR-01', 1500);
+  assert(valid.success === true, 'a genuine positive maxPrice still works normally');
+}
+
+console.log('\nfindAlternativesByColour — refuses a missing/empty excludeColour instead of silently matching every colour');
+{
+  const empty = findAlternativesByColourTool('K-KUR-03', '');
+  assert(empty.success === false, 'an empty excludeColour (the executor default for a missing argument) is refused');
+  const whitespace = findAlternativesByColourTool('K-KUR-03', '   ');
+  assert(whitespace.success === false, 'a whitespace-only excludeColour is refused');
+  const valid = findAlternativesByColourTool('K-KUR-03', 'Clay');
+  assert(valid.success === true, 'a genuine excludeColour still works normally');
 }
 
 console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`}`);

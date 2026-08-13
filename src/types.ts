@@ -159,6 +159,11 @@ export interface ProductImage {
   name: string;
   price: number;
   imageUrl: string;
+  /** A real, code-computed link to this product's own page — see
+   * lib/productImages.ts's productImageFor, the only place this is ever
+   * built (from BrandConfig's productBaseUrl + the real itemId). Never
+   * something the model states in text. */
+  productUrl: string;
 }
 
 export interface ChatMessage {
