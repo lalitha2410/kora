@@ -937,8 +937,8 @@ async function streamChatCompletion(
  * checks eligibility but then still skips generateDiscountCode (also
  * forced) — one retry corrected only the first miss and let the second
  * one straight through. Capped, not unbounded, so a model that's
- * persistently wrong doesn't loop forever; the outer `guard < 6` round
- * limit is the hard backstop either way. */
+ * persistently wrong doesn't loop forever; the outer round limit (see
+ * sendAgentMessage's `guard` loop) is the hard backstop either way. */
 const MAX_GUARDRAIL_RETRIES = 2;
 
 export async function sendAgentMessage(
@@ -971,7 +971,17 @@ export async function sendAgentMessage(
   let guard = 0;
   let forcedToolName: string | undefined = initialForcedTool;
   let guardrailRetries = 0;
-  while (guard < 6) {
+  // The worst-case legitimate chain now realistically needs more than 6
+  // rounds: getCartDetails + checkDiscountEligibility + findSimilarItems
+  // (3 tool-call rounds) followed by up to MAX_GUARDRAIL_RETRIES (2)
+  // discarded reply attempts, each itself forcing another tool-call round
+  // before the NEXT reply attempt is even generated — 8 rounds before the
+  // first attempt that's actually still being checked. Found live at 6:
+  // a weak fallback provider's 2nd forced retry got discarded right at the
+  // round-6 boundary, with no round left to produce the accepted reply —
+  // falling through to the generic "having trouble" apology on a cart
+  // whose real answer (a single genuine alternative) was one round away.
+  while (guard < 9) {
     guard += 1;
     const requestMessages = buildRequestMessages(chat.messages, contextSummary);
 
@@ -1004,6 +1014,25 @@ export async function sendAgentMessage(
           forcedToolName = requiredTool;
           continue;
         }
+      } else if (guardrail && guardrail(content)) {
+        // The retry budget is exhausted, but the guardrail STILL flags
+        // this reply — found live: a fabricated ₹3,990 price (the real
+        // value was ₹4,999) reached the customer on exactly this path,
+        // because once guardrailRetries hits MAX_GUARDRAIL_RETRIES the
+        // guardrail previously stopped being consulted at all, so
+        // whatever the model said next was accepted completely
+        // unchecked. A generic apology is strictly safer than showing a
+        // reply already known to invent a price, a product, or a link —
+        // see buildTurnGuardrail's own doc for why those three checks are
+        // unconditional in the first place. Falls through to the same
+        // "having trouble" message the outer round-budget exhaustion
+        // already uses below, rather than a tool-forced retry (there is
+        // no more retry budget left to spend).
+        console.warn(
+          `[llmProvider] guardrail: ${servedBy} still flagged after ${MAX_GUARDRAIL_RETRIES} corrections — suppressing the reply instead of showing a known-bad one`,
+          { content },
+        );
+        break;
       }
       if (buffering) onTextDelta?.(buffered || content);
       chat.messages.push({ role: 'assistant', content });

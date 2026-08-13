@@ -317,30 +317,56 @@ const FLOW: FlowStep[] = [
  */
 const OPTION_MARKER_PATTERN = /[1-9]️?⃣|\b[1-9]\./g;
 
-function looksLikeFabricatedOptionsList(text: string): boolean {
-  const markers = text.match(OPTION_MARKER_PATTERN) ?? [];
-  return markers.length >= 2;
+/**
+ * True when a reply's numbered list contains an entry that doesn't
+ * correspond to a REAL item from the tool result it's supposed to
+ * represent — by COUNT (more markers than real items exist) or by
+ * IDENTITY (a marker whose text doesn't genuinely describe any real item).
+ * Found live, CART-008: findSimilarItems returned exactly one real item
+ * (Clay Hand Block-Print Midi Dress, ₹2799), and the reply presented it
+ * alongside a fully invented second product — "Linen Relaxed Fit Shirt —
+ * ₹2299" — a catalog item that has never existed. This replaced two
+ * narrower, count-only predecessors (looksLikeFabricatedOptionsList,
+ * looksLikePaddedOptionsList) that could only catch a numbered list
+ * outnumbering the real items, never a list that stayed the RIGHT length
+ * but swapped in a wrong or invented entry — the exact shape of this bug,
+ * since the reply's 2 markers happened to match a plausible expectation
+ * even though only 1 of those 2 entries was real.
+ *
+ * Deliberately counts how many REAL items are genuinely described in the
+ * text (repliesGenuinelyDescribe, word-overlap — resistant to the same
+ * paraphrasing/Unicode-dash noise the image-attachment matching already
+ * had to survive) rather than trying to parse which text span belongs to
+ * which marker — parsing free-form list formatting reliably is far more
+ * fragile than just asking "how many of the real items does this text
+ * actually, genuinely talk about," which is exactly the number that must
+ * equal the marker count for every marker to be a real, selectable option.
+ * If markers outnumber genuinely-described real items — whether because
+ * the list is too long, or because one entry describes something that
+ * isn't real — that's a customer looking at a numbered option that leads
+ * nowhere if they pick it. A single marker is exempted (a lone reference
+ * to "1." in prose isn't a list at all) — this only ever fires on a
+ * genuine multi-entry list, same threshold every other list-shaped check
+ * in this file uses.
+ */
+function looksLikeFabricatedProductInList(content: string, facts: ConversationFacts): boolean {
+  const markers = content.match(OPTION_MARKER_PATTERN) ?? [];
+  if (markers.length < 2) return false;
+  const items = facts.pendingOptions?.items ?? [];
+  const genuineCount = items.filter((it) => repliesGenuinelyDescribe(content, it.name)).length;
+  return markers.length > genuineCount;
 }
 
 /**
- * True when a reply's numbered list has MORE entries than the tool result
- * it's supposed to represent — found live on CART-008: getActiveSales
- * returned exactly one real item, and the reply padded it with a fake
- * "2️⃣ (If you'd like another style, let me know!)" — not a real option,
- * just an invitation dressed as one. If the customer answers "2" it means
- * nothing: validatePendingChoice/captureNextReply only ever resolve against
- * facts.pendingOptions.items (the REAL count), so a numbered reply that
- * outnumbers them breaks the "every number on screen is selectable"
- * contract the customer sees. Deliberately keyed off the LIVE
- * facts.pendingOptions (whichever alternative tool most recently ran, this
- * turn or a prior one) rather than a count captured once — same reasoning
- * as the rest of this guardrail.
+ * Which tool re-grounds the model after a fabricated product-list entry —
+ * whichever tool actually produced the real items (so the model sees the
+ * genuine, short list again), or getCartDetails as a safe fallback on the
+ * rarer case where the list was invented from nothing, with no real tool
+ * call behind it at all.
  */
-function looksLikePaddedOptionsList(content: string, facts: ConversationFacts): boolean {
-  const items = facts.pendingOptions?.items;
-  if (!items || items.length === 0) return false;
-  const markers = content.match(OPTION_MARKER_PATTERN) ?? [];
-  return markers.length > items.length;
+function requiredProductListCorrectionTool(content: string, facts: ConversationFacts): string | undefined {
+  if (!looksLikeFabricatedProductInList(content, facts)) return undefined;
+  return facts.pendingOptions?.tool ?? 'getCartDetails';
 }
 
 /**
@@ -446,10 +472,15 @@ function looksLikePriceObjectionNonAnswer(content: string, facts: ConversationFa
     (facts.discountEligible === false && DISCOUNT_DECLINE_PATTERN.test(content));
   if (hasDiscountDecision) return false;
 
+  // Deliberately requires a REAL item to be genuinely described — "looks
+  // like a numbered list" used to count on its own here too, which is
+  // exactly the loophole that let a fabricated list read as "handled":
+  // shaped like an answer, containing zero real options. See
+  // looksLikeFabricatedProductInList, checked separately (and earlier) for
+  // that exact failure — this check only needs to know whether the reply
+  // genuinely engaged with something real.
   const pendingItems = facts.pendingOptions?.items ?? [];
-  const lowerContent = content.toLowerCase();
-  const mentionsAlternative =
-    pendingItems.some((item) => lowerContent.includes(item.name.toLowerCase())) || looksLikeFabricatedOptionsList(content);
+  const mentionsAlternative = pendingItems.some((item) => repliesGenuinelyDescribe(content, item.name));
   if (mentionsAlternative) return false;
 
   return true;
@@ -731,31 +762,32 @@ function buildInitialForcedTool(customerMessage: string, facts: ConversationFact
  *     several rounds before this check point is even reached — evaluating
  *     it once up front risks forcing an already-redundant call one round
  *     too late to matter).
- *  3. Fabricated options list — an alternatives list is pending the
- *     customer's choice (see currentPendingQuestion) and the reply reads
- *     like a numbered list without actually calling the tool that list
- *     should have come from.
- *  4. Padded options list — the tool that just ran returned fewer items
- *     than the reply's numbered list shows (see looksLikePaddedOptionsList)
- *     — a non-option dressed up as a selectable entry.
- *  5. Missing price justification — the item is genuinely not
+ *  3. Missing price justification — the item is genuinely not
  *     discountable and the reply jumps straight to an alternative without
  *     ever citing this item's own real attributes for why (see
- *     looksLikeMissingPriceJustification). Checked independently of #2/#6
+ *     looksLikeMissingPriceJustification). Checked independently of #2/#4
  *     (a reply can correctly decide+offer an alternative and STILL skip
  *     the justification — these are different failures).
- *  6. Non-answer — neither a discount decision nor a real alternative
+ *  4. Non-answer — neither a discount decision nor a real alternative
  *     appears anywhere in the reply at all (see
  *     looksLikePriceObjectionNonAnswer). The catch-all, checked last.
  *
- * Two 0th checks, ahead of all of these, always run regardless of any of
- * the conditions above: looksLikeFabricatedCheckoutLink and
- * looksLikeFabricatedClaim. A hallucinated checkout URL, price, discount
- * percentage, or stock/size claim are all serious enough on their own (a
- * customer could click a fake link, or act on a fake price or
- * availability claim) that neither can be gated behind "this looked like
- * a price objection" — this is the reason the closure is now always
- * built, never skipped for a cheap early return.
+ * Three 0th checks, ahead of all of these, always run regardless of any of
+ * the conditions above: looksLikeFabricatedCheckoutLink,
+ * looksLikeFabricatedProductInList, and the claim guard
+ * (requiredClaimCorrectionTool). A hallucinated checkout URL, an invented
+ * PRODUCT in a numbered list, and a fabricated price/percentage/
+ * availability claim are all serious enough on their own (a customer could
+ * click a fake link, pick an option that doesn't exist, or act on a fake
+ * price) that none can be gated behind "this looked like a price
+ * objection" — this is why the closure is always built, never skipped for
+ * a cheap early return. The invented-product check runs SECOND, right
+ * after the checkout-link check and ahead of even the claim guard: found
+ * live, a reply presenting a real ₹2799 item alongside a fully invented
+ * "Linen Relaxed Fit Shirt — ₹2299" is worse than a wrong price alone — a
+ * customer could select an option that doesn't exist — so it gets first
+ * claim on the limited guardrail-retry budget, before anything else has a
+ * chance to consume it on a less severe correction.
  */
 function buildTurnGuardrail(
   customerMessage: string,
@@ -771,13 +803,19 @@ function buildTurnGuardrail(
     // in a real tool result instead of another guess.
     if (looksLikeFabricatedCheckoutLink(content, facts)) return 'createCheckoutLink';
 
-    // Also unconditional, same tier — a fabricated price, discount
-    // percentage, or availability claim is at least as serious as a
-    // fabricated URL (see the CLAIM GUARD section's own header comment),
-    // so it can't be gated behind "this looked like a price objection"
-    // either. See requiredClaimCorrectionTool's own doc for why the
-    // corrective tool depends on WHICH claim was fabricated, rather than
-    // always re-forcing getCartDetails.
+    // Also unconditional, checked SECOND — see this function's own doc for
+    // why an invented product gets first claim on the retry budget, ahead
+    // of even the claim guard just below.
+    const productListCorrection = requiredProductListCorrectionTool(content, facts);
+    if (productListCorrection) return productListCorrection;
+
+    // Also unconditional — a fabricated price, discount percentage, or
+    // availability claim is at least as serious as a fabricated URL (see
+    // the CLAIM GUARD section's own header comment), so it can't be gated
+    // behind "this looked like a price objection" either. See
+    // requiredClaimCorrectionTool's own doc for why the corrective tool
+    // depends on WHICH claim was fabricated, rather than always re-forcing
+    // getCartDetails.
     const claimCorrection = requiredClaimCorrectionTool(content, facts);
     if (claimCorrection) return claimCorrection;
 
@@ -791,8 +829,6 @@ function buildTurnGuardrail(
       const required = requiredPriceObjectionTool(facts);
       if (required) return required;
     }
-    if (pendingAlternativeTool && looksLikeFabricatedOptionsList(content)) return pendingAlternativeTool;
-    if (facts.pendingOptions && looksLikePaddedOptionsList(content, facts)) return facts.pendingOptions.tool;
     // Re-forces getCartDetails specifically — not findSimilarItems/etc —
     // since the missing piece here is the model actually USING the fabric
     // data it already fetched, not a new search. A fresh look at the same
@@ -1293,6 +1329,20 @@ function updateFacts(facts: ConversationFacts, name: string, _args: Record<strin
         facts.discountPercent = r.discountPercent as number | undefined;
         facts.discountCode = r.discountCode as string | undefined;
         recordPercent(facts, r.discountPercent as number | undefined);
+      } else {
+        // A failed generateDiscountCode call means eligibility was just
+        // checked INTERNALLY (pricingPolicy.ts's own checkDiscountEligibility)
+        // and found false — even when the model skipped calling the
+        // separate checkDiscountEligibility tool first and went straight
+        // here. Without this, facts never learns the item is ineligible,
+        // so a reply that correctly explains that can never satisfy
+        // looksLikePriceObjectionNonAnswer's hasDiscountDecision check
+        // (which specifically requires facts.discountEligible === false) —
+        // found live, CART-008: this alone was enough to exhaust the
+        // guardrail retry budget into the generic "having trouble" apology
+        // on a turn whose actual reply content was fine.
+        facts.discountEligibilityChecked = true;
+        facts.discountEligible = false;
       }
       break;
     case 'createCheckoutLink':
